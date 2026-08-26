@@ -166,14 +166,32 @@ void SingleFlashAttention(const size_t start_pos, const size_t last_pos,
     m = cap * std::tanh(m / cap);
   }
   float d = 1.0f;
-  // This is just a copy of the first token.
-  MulByConstTo(d, v.Row(pos_mod), att_out, v.Cols(), ctx, worker);
+  // Accumulate an unnormalized softmax numerator. The previous implementation
+  // kept att_out normalized after every position, which required rescaling the
+  // entire qkv_dim vector and two exponentials per history token. Here the
+  // numerator only needs rescaling when a new maximum is encountered, and is
+  // normalized once after the sweep.
+  MulByConstTo(/*mul=*/1.0f, v.Row(pos_mod), att_out, v.Cols(), ctx, worker);
   for (size_t pos = start_pos + 1; pos <= last_pos; ++pos) {
     const size_t pos_mod = activations.div_seq_len.Remainder(pos);
     float x = Dot(q, k.Row(pos_mod), k.Cols());
-    SingleFlashAttentionStep(x, activations.config.att_cap, m, d,
-                             v.Row(pos_mod), v.Cols(), att_out);
+    if (activations.config.att_cap > 0.0f) {
+      const float cap = activations.config.att_cap;
+      x = cap * std::tanh(x / cap);
+    }
+    if (x > m) {
+      const float scale = std::exp(m - x);
+      d = d * scale + 1.0f;
+      m = x;
+      MulByConst(scale, att_out, v.Cols());
+      MulByConstAndAdd(/*mul=*/1.0f, v.Row(pos_mod), att_out, v.Cols());
+    } else {
+      const float weight = std::exp(x - m);
+      d += weight;
+      MulByConstAndAdd(weight, v.Row(pos_mod), att_out, v.Cols());
+    }
   }
+  MulByConst(1.0f / d, att_out, v.Cols());
 }
 
 // Computes and returns a single vector of NF Q.K dot products, which represents
