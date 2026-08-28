@@ -196,10 +196,12 @@ cc_test(
 
 cc_library(
     name = "test_util",
+    testonly = True,
     hdrs = ["util/test_util.h"],
     deps = [
         ":basics",
         ":mat",
+        "//testing/base/public:gunit_for_library_testonly",
         "@highway//:hwy",
         "@highway//:hwy_test_util",
         "@highway//:nanobenchmark",
@@ -250,7 +252,7 @@ cc_test(
     ],
     deps = [
         ":tokenizer",
-        "//testing/base/public:gunit_main",  # buildcleaner: keep
+        "@googletest//:gtest_main",  # buildcleaner: keep
         "//io",
     ],
 )
@@ -265,7 +267,7 @@ cc_test(
     ],
     deps = [
         ":tokenizer",
-        "//testing/base/public:gunit_main",  # buildcleaner: keep
+        "@googletest//:gtest_main",  # buildcleaner: keep
         "//io",
     ],
 )
@@ -347,7 +349,10 @@ cc_library(
 cc_library(
     name = "weights",
     srcs = ["gemma/weights.cc"],
-    hdrs = ["gemma/weights.h"],
+    hdrs = [
+        "gemma/weights.h",
+        "gemma/weights_internal.h",
+    ],
     deps = [
         ":configs",
         ":gemma_args",
@@ -374,6 +379,23 @@ cc_test(
         "@googletest//:gtest_main",  # buildcleaner: keep
         "//compression:compress",
         "@highway//:hwy",  # aligned_allocator.h
+    ],
+)
+
+cc_test(
+    name = "weights_test",
+    srcs = ["gemma/weights_test.cc"],
+    deps = [
+        ":gemma_args",
+        ":mat",
+        ":threading_context",
+        ":weights",
+        "//compression:compress",
+        "//compression:types",
+        "//io",
+        "//io:blob_store",
+        "@googletest//:gtest_main",  # buildcleaner: keep
+        "@highway//:hwy",
     ],
 )
 
@@ -459,6 +481,7 @@ cc_library(
         "ops/matmul_static_sfp.cc",
         "ops/matmul_static_i8.cc",
         "ops/matmul_static_q4_0.cc",
+        "ops/matmul_static_mxfp4.cc",
     ],
     hdrs = [
         "ops/matmul_static.h",
@@ -1017,8 +1040,8 @@ cc_test(
         ":benchmark_helper",
         ":configs",
         ":gemma_lib",
-        "@googletest//:gtest_main",  # buildcleaner: keep
-        "//io",
+        ":test_util",
+        "//testing/base/public:gunit_for_library_testonly",  # buildcleaner: keep
         "@highway//:hwy",
         "@highway//:hwy_test_util",
     ],
@@ -1058,6 +1081,7 @@ cc_test(
     deps = [
         ":benchmark_helper",
         ":gemma_lib",
+        ":test_util",
         "@googletest//:gtest_main",  # buildcleaner: keep
         "@highway//:hwy",
         "@highway//:hwy_test_util",
@@ -1091,7 +1115,8 @@ cc_test(
         ":benchmark_helper",
         ":configs",
         ":gemma_lib",
-        "@googletest//:gtest_main",  # buildcleaner: keep
+        ":test_util",
+        "//testing/base/public:gunit_for_library_testonly",  # buildcleaner: keep
         "//io",
         "@highway//:abort_header_only",
         "@highway//:hwy_test_util",
@@ -1156,6 +1181,7 @@ cc_binary(
     deps = [
         ":benchmark_helper",
         "@google_benchmark//:benchmark",
+        "//io",
         "@highway//:hwy",  # base.h
     ],
 )

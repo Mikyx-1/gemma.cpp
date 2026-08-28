@@ -29,18 +29,23 @@
 #include "gemma/configs.h"
 #include "gemma/gemma_args.h"
 #include "gemma/model_store.h"
+#include "gemma/weights_internal.h"
+#include "hwy/base.h"
+#include "hwy/highway.h"
+#include "hwy/profiler.h"
 #include "io/blob_store.h"
 #include "util/mat.h"
 #include "util/threading_context.h"
 #include "util/zones.h"
-#include "hwy/base.h"
-#include "hwy/highway.h"
-#include "hwy/profiler.h"
 
 // TODO: move into foreach_target
 #include "compression/compress-inl.h"
 
 namespace gcpp {
+
+namespace hn = hwy::HWY_NAMESPACE;
+
+using weights_internal::TensorToRead;
 
 static std::mutex g_mat_owners_mutex;
 
@@ -69,20 +74,17 @@ void LayerWeightsPtrs::InitAttWeights(std::vector<MatOwner>& mat_owners,
   HWY_ASSERT(attn_vec_einsum_w.Rows() == heads * model_dim);
   HWY_ASSERT(attn_vec_einsum_w.Cols() == qkv_dim);
 
-  const MatPadding padding =
-      (att_weights.GetType() == Type::kQ4_0)
-          ? MatPadding::kPacked
-          : MatPadding::kOdd;
+  const MatPadding padding = DefaultPadding(att_weights.GetType());
   {
     std::lock_guard<std::mutex> lock(g_mat_owners_mutex);
     mat_owners.push_back(MatOwner());
     mat_owners.back().AllocateFor(att_weights, allocator, padding);
   }
 
-  if (att_weights.GetType() == Type::kQ4_0) {
+  if (IsPacked(att_weights.GetType())) {
     const size_t cols = heads * qkv_dim;
-    const size_t src_row_bytes = Q4_0Stream::PackedEnd(qkv_dim);
-    const size_t dst_row_bytes = Q4_0Stream::PackedEnd(cols);
+    const size_t src_row_bytes = PackedEnd(att_weights.GetType(), qkv_dim);
+    const size_t dst_row_bytes = PackedEnd(att_weights.GetType(), cols);
     HWY_ASSERT(dst_row_bytes == heads * src_row_bytes);
 
     uint8_t* dst_ptr = att_weights.RowBytes(0);
@@ -115,16 +117,12 @@ static void SplitPackedMatrix(MatPtr& parent, size_t split_row, MatPtr& w1,
   uint8_t* base_ptr = parent.RowBytes(0);
   w1.SetPtr(base_ptr, stride);
 
-  size_t split_bytes = 0;
-  if (parent.GetType() == Type::kQ4_0) {
-    split_bytes = Q4_0Stream::PackedEnd(split_row * stride);
-  } else if (parent.GetType() == Type::kNUQ) {
-    split_bytes = NuqStream::PackedEnd(split_row * stride);
-  } else {
-    w2.SetPtr(parent.RowBytes(split_row), stride);
+  if (IsPacked(parent.GetType())) {
+    const size_t split_bytes = PackedEnd(parent.GetType(), split_row * stride);
+    w2.SetPtr(base_ptr + split_bytes, stride);
     return;
   }
-  w2.SetPtr(base_ptr + split_bytes, stride);
+  w2.SetPtr(parent.RowBytes(split_row), stride);
 }
 
 // For FFN. Fast, only updates pointers.
@@ -313,7 +311,7 @@ static void HWY_MAYBE_UNUSED InitAttWeightsI8(
   hwy::AlignedFreeUniquePtr<float[]> att_weights_tmp =
       hwy::AllocateAligned<float>(model_dim * heads * qkv_dim);
 
-  const hwy::HWY_NAMESPACE::ScalableTag<float> df;
+  const hn::ScalableTag<float> df;
   HWY_NAMESPACE::DecompressAndZeroPad(df, attn_vec_einsum_w.Span(), 0,
                                       attn_vec_einsum_w_tmp.get(),
                                       model_dim * heads * qkv_dim);
@@ -377,7 +375,7 @@ static void HWY_MAYBE_UNUSED SplitW1I8(const LayerConfig& layer_config,
   hwy::AlignedFreeUniquePtr<float[]> w_tmp =
       hwy::AllocateAligned<float>(total_size);
 
-  const hwy::HWY_NAMESPACE::ScalableTag<float> df;
+  const hn::ScalableTag<float> df;
   HWY_NAMESPACE::DecompressAndZeroPad(df, gating_einsum_w.Span(), 0,
                                       w_tmp.get(), total_size);
 
@@ -434,7 +432,7 @@ static void HWY_MAYBE_UNUSED SplitAttW1I8(const LayerConfig& layer_config,
     hwy::AlignedFreeUniquePtr<float[]> w_tmp =
         hwy::AllocateAligned<float>(w1_size);
 
-    const hwy::HWY_NAMESPACE::ScalableTag<float> df;
+    const hn::ScalableTag<float> df;
     HWY_NAMESPACE::DecompressAndZeroPad(df, qkv_einsum_w.Span(), 0, w_tmp.get(),
                                         w1_size);
 
@@ -473,7 +471,7 @@ static void HWY_MAYBE_UNUSED SplitAttW1I8(const LayerConfig& layer_config,
   hwy::AlignedFreeUniquePtr<float[]> w_tmp =
       hwy::AllocateAligned<float>(total_size);
 
-  const hwy::HWY_NAMESPACE::ScalableTag<float> df;
+  const hn::ScalableTag<float> df;
   HWY_NAMESPACE::DecompressAndZeroPad(df, qkv_einsum_w.Span(), 0, w_tmp.get(),
                                       total_size);
 
@@ -495,8 +493,7 @@ static void HWY_MAYBE_UNUSED SplitAttW1I8(const LayerConfig& layer_config,
 // Must be called after reading weights via `ForEachTensor`.
 // TODO: exporters should bake this into the weights already.
 // WARNING: called from multiple threads; `mat_owners` requires a lock.
-void LayerWeightsPtrs::Fixup(Model model,
-                             std::vector<MatOwner>& mat_owners,
+void LayerWeightsPtrs::Fixup(Model model, std::vector<MatOwner>& mat_owners,
                              ThreadingContext& ctx) {
   if (attn_vec_einsum_w.GetType() == Type::kI8) {
     MatPtrT<I8Stream> attn_vec_einsum_w_i8(attn_vec_einsum_w);
@@ -540,8 +537,8 @@ void LayerWeightsPtrs::Fixup(Model model,
     // structural condition (e.g. !IsMHA() && kv_heads > 1) once we
     // verify it doesn't regress other multi-kv-head models.
     // This applies to Gemma 4 global layers; the model check will be expanded.
-    if (model == Model::GEMMA4_26B_MOE &&
-        layer_config.kv_heads == 2 && layer_config.qkv_dim == 512) {
+    if (model == Model::GEMMA4_26B_MOE && layer_config.kv_heads == 2 &&
+        layer_config.qkv_dim == 512) {
       const size_t old_stride = qkv_einsum_w2.Stride();
       const size_t elem_bytes = qkv_einsum_w2.ElementBytes();
       const size_t old_row_bytes = old_stride * elem_bytes;
@@ -665,12 +662,19 @@ std::vector<uint32_t> WeightsPtrs::AddTensorDataToWriter(
 }
 
 // Decides whether to read or map based on heuristics and user override.
-static WeightsPtrs::Mode ChooseMode(uint64_t file_bytes,
-                                    const LoaderArgs& loader,
-                                    const InferenceArgs& inference,
-                                    const Allocator& allocator) {
+WeightsPtrs::Mode weights_internal::ChooseMode(uint64_t file_bytes,
+                                               const LoaderArgs& loader,
+                                               const InferenceArgs& inference,
+                                               const Allocator& allocator) {
   Tristate to_bf16 = loader.to_bf16;
   Tristate map = loader.map;
+
+  // An explicit request to convert the embedding requires owned memory. Do
+  // not let the automatic mapping heuristic override that request. An
+  // explicit --map=1 is still honored and diagnosed in ReadFromBlobs.
+  if (loader.sfp_embedding == Tristate::kTrue && map == Tristate::kDefault) {
+    map = Tristate::kFalse;
+  }
 
   // Disable mapping if not padded to the base page size.
   if (file_bytes % allocator.BasePageBytes() != 0) {
@@ -714,18 +718,6 @@ static WeightsPtrs::Mode ChooseMode(uint64_t file_bytes,
                                       : WeightsPtrs::Mode::kRead;
 }
 
-struct TensorToRead {
-  MatPtr* mat;
-  BlobRange range;
-  // Some tensors opt out of padding via kPacked flags.
-  MatPadding padding;
-
-  // only for kReadBF16
-  bool keep_type = false;
-  Type prev_type;
-  size_t prev_packed_bytes = 0;
-};
-
 // Allocates multiple in parallel and binds to NUMA nodes.
 static void AllocateAndBindAll(std::vector<TensorToRead>& tensors,
                                const WeightsPtrs::Mode mode,
@@ -743,8 +735,16 @@ static void AllocateAndBindAll(std::vector<TensorToRead>& tensors,
 
         tensor.prev_type = mat.GetType();
         tensor.prev_packed_bytes = mat.PackedBytes();
-        // We only care about MatMul inputs; skip F32 or small tensors.
-        if (tensor.prev_type == Type::kF32 || mat.Rows() < 1024) {
+        // Only worthwhile from 16/32-bit types; the others are already <= 8
+        // bits, and NUQ is smaller than SFP.
+        if (tensor.to_sfp && tensor.prev_type != Type::kF32 &&
+            tensor.prev_type != Type::kBF16) {
+          tensor.to_sfp = false;
+        }
+        if (tensor.to_sfp) {
+          mat.SetType(Type::kSFP);
+          // We only care about MatMul inputs; skip F32 or small tensors.
+        } else if (tensor.prev_type == Type::kF32 || mat.Rows() < 1024) {
           tensor.keep_type = true;
           tensor.padding = MatPadding::kPacked;  // single I/O for simplicity
         } else if (mode == WeightsPtrs::Mode::kReadBF16) {
@@ -779,7 +779,7 @@ static void MapAll(const std::vector<TensorToRead>& tensors,
 template <typename T>
 static void DecompressToBF16(MatPtr& mat,
                              const hwy::AlignedFreeUniquePtr<uint8_t[]>& buf) {
-  hwy::HWY_NAMESPACE::ScalableTag<BF16> dbf;
+  hn::ScalableTag<BF16> dbf;
   const size_t cols = mat.Cols();
 
   const size_t num_packed = CompressedArrayElements<T>(mat.Extents().Area());
@@ -804,8 +804,8 @@ static void ReadAllToBF16(const std::vector<TensorToRead>& tensors,
                 const TensorToRead& tensor = tensors[task];
                 MatPtr& mat = *tensor.mat;
                 // Validate blob size matches allocated buffer before any read.
-                // MapAll (line ~557) and MakeBatches (line ~645) both assert this;
-                // this path was the only one missing the check.
+                // MapAll (line ~557) and MakeBatches (line ~645) both assert
+                // this; this path was the only one missing the check.
                 HWY_ASSERT_M(tensor.range.bytes == tensor.prev_packed_bytes,
                              mat.Name());
 
@@ -835,11 +835,195 @@ static void ReadAllToBF16(const std::vector<TensorToRead>& tensors,
                     return DecompressToBF16<SfpStream>(*tensor.mat, buf);
                   case Type::kQ4_0:
                     return DecompressToBF16<Q4_0Stream>(*tensor.mat, buf);
+                  case Type::kMXFP4:
+                    return DecompressToBF16<MxFp4Stream>(*tensor.mat, buf);
                   default:
                     HWY_ABORT("Unsupported type %s",
                               TypeName(tensor.prev_type));
                 }
               });
+}
+
+// Tensors flagged `to_sfp`, in any mode that reads rather than maps:
+
+// Number of rows to read per parallel task. Rows are grouped so that the reads
+// are large enough to be efficient, but small enough that the transient buffers
+// are negligible: staging the whole tensor would defeat the purpose of
+// compressing it.
+static size_t RowsPerChunk(size_t row_bytes) {
+  constexpr size_t kTargetBytes = 4 * 1024 * 1024;
+  return HWY_MAX(size_t{1}, kTargetBytes / HWY_MAX(size_t{1}, row_bytes));
+}
+
+// Holds the per-task buffers for one chunk of `rows_per_chunk` rows, so that
+// both passes below can reuse the same code.
+template <typename T>
+class Chunk {
+ public:
+  Chunk(size_t cols, size_t rows_per_chunk)
+      : cols_(cols), rows_per_chunk_(rows_per_chunk) {
+    const hn::ScalableTag<float> df;
+    const size_t NF = hn::Lanes(df);
+    buf_ = hwy::AllocateAligned<uint8_t>(rows_per_chunk * cols * sizeof(T));
+    // `DecompressAndZeroPad` writes whole vectors, and `compress-inl.h`
+    // requires up to two of them beyond the requested count.
+    raw_ = hwy::AllocateAligned<float>(
+        hwy::RoundUpTo(rows_per_chunk * cols, NF) + 4 * NF);
+    HWY_ASSERT(buf_ && raw_);
+  }
+
+  // Reads rows `[begin, end)` from the file, where the tensor is stored as
+  // type `T` and packed, hence `mat.Stride()` does not apply. Returns the
+  // decompressed values, ignoring `mat.Scale()`.
+  float* Decompress(const TensorToRead& tensor, const BlobReader& reader,
+                    size_t begin, size_t end) {
+    HWY_DASSERT(end - begin <= rows_per_chunk_);
+    const size_t row_bytes = cols_ * sizeof(T);
+    const size_t num = (end - begin) * cols_;
+    HWY_ASSERT(reader.file().Read(tensor.range.offset + begin * row_bytes,
+                                  num * sizeof(T), buf_.get()));
+
+    // Rows are contiguous in both source and destination, hence decompress the
+    // entire chunk at once: this is faster, and prevents the zero padding from
+    // overwriting the start of the next row.
+    const hn::ScalableTag<float> df;
+    const PackedSpan<T> packed{HWY_RCAST_ALIGNED(T*, buf_.get()), num};
+    HWY_NAMESPACE::DecompressAndZeroPad(df, packed, 0, raw_.get(), num);
+    return raw_.get();
+  }
+
+ private:
+  size_t cols_;
+  size_t rows_per_chunk_;
+  hwy::AlignedFreeUniquePtr<uint8_t[]> buf_;
+  hwy::AlignedFreeUniquePtr<float[]> raw_;
+};
+
+// Returns the largest magnitude in the tensor, ignoring `mat.Scale()`.
+template <typename T>
+static float MaxAbs(const TensorToRead& tensor, const BlobReader& reader,
+                    size_t rows_per_chunk, size_t num_chunks,
+                    ThreadingContext& ctx) {
+  const MatPtr& mat = *tensor.mat;
+  const size_t rows = mat.Rows();
+  const size_t cols = mat.Cols();
+  // Indexed by chunk rather than by worker, so that we need not know how many
+  // workers `ParallelFor` will use.
+  std::vector<float> chunk_max(num_chunks, 0.0f);
+
+  ParallelFor(Parallelism::kFlat, num_chunks, ctx, /*cluster_idx=*/0,
+              Callers::kReadAllToSFP, [&](uint64_t chunk, size_t thread) {
+                GCPP_ZONE(ctx, thread, Zones::kStartupWeightsReadAllToSFP);
+                const size_t begin = chunk * rows_per_chunk;
+                const size_t end = HWY_MIN(begin + rows_per_chunk, rows);
+                Chunk<T> buffers(cols, rows_per_chunk);
+                const float* raw =
+                    buffers.Decompress(tensor, reader, begin, end);
+
+                using DF = hn::ScalableTag<float>;
+                using VF = hn::Vec<DF>;
+                const DF df;
+                const size_t NF = hn::Lanes(df);
+                const size_t num = (end - begin) * cols;
+                VF max0 = hn::Zero(df);
+                VF max1 = hn::Zero(df);
+                size_t i = 0;
+                for (; i + 2 * NF <= num; i += 2 * NF) {
+                  max0 = hn::Max(max0, hn::Abs(hn::LoadU(df, raw + i)));
+                  max1 = hn::Max(max1, hn::Abs(hn::LoadU(df, raw + i + NF)));
+                }
+                if (i + NF <= num) {
+                  max0 = hn::Max(max0, hn::Abs(hn::LoadU(df, raw + i)));
+                  i += NF;
+                }
+                float maxabs = hn::ReduceMax(df, hn::Max(max0, max1));
+                for (; i < num; ++i) {
+                  maxabs = HWY_MAX(maxabs, hwy::ScalarAbs(raw[i]));
+                }
+                chunk_max[chunk] = maxabs;
+              });
+
+  float maxabs = 0.0f;
+  for (const float m : chunk_max) maxabs = HWY_MAX(maxabs, m);
+  return maxabs;
+}
+
+// Reads the tensor as stored in the file (type `T`) and compresses it into
+// `mat`, whose type `AllocateAndBindAll` already changed to `Type::kSFP`.
+// The file is read twice because `SfpStream` encodes a limited range of
+// magnitudes, hence we may need a per-tensor scale, which requires knowing the
+// largest magnitude before encoding anything. The second read is typically
+// served from the OS cache.
+template <typename T>
+static void CompressToSFP(const TensorToRead& tensor, const BlobReader& reader,
+                          ThreadingContext& ctx) {
+  MatPtr& mat = *tensor.mat;
+  const size_t rows = mat.Rows();
+  const size_t cols = mat.Cols();
+  const size_t rows_per_chunk = RowsPerChunk(cols * sizeof(T));
+  const size_t num_chunks = hwy::DivCeil(rows, rows_per_chunk);
+
+  const float prev_scale = mat.Scale();
+  const float maxabs =
+      MaxAbs<T>(tensor, reader, rows_per_chunk, num_chunks, ctx) * prev_scale;
+  const float scale =
+      (maxabs <= SfpStream::kMax) ? 1.0f : maxabs / SfpStream::kMax;
+  const float mul = prev_scale / scale;
+
+  ParallelFor(Parallelism::kFlat, num_chunks, ctx, /*cluster_idx=*/0,
+              Callers::kReadAllToSFP, [&](uint64_t chunk, size_t thread) {
+                GCPP_ZONE(ctx, thread, Zones::kStartupWeightsReadAllToSFP);
+                const size_t begin = chunk * rows_per_chunk;
+                const size_t end = HWY_MIN(begin + rows_per_chunk, rows);
+                Chunk<T> buffers(cols, rows_per_chunk);
+                float* raw = buffers.Decompress(tensor, reader, begin, end);
+
+                if (mul != 1.0f) {
+                  for (size_t i = 0; i < (end - begin) * cols; ++i) {
+                    // Clamp because rounding may still exceed `kMax`.
+                    const float magn =
+                        HWY_MIN(SfpStream::kMax, hwy::ScalarAbs(raw[i] * mul));
+                    raw[i] = hwy::ScalarCopySign(magn, raw[i]);
+                  }
+                }
+
+                // Row by row because destination rows are padded, whereas `raw`
+                // is not. This is safe because `SfpStream` is a per-value
+                // encoding.
+                CompressPerThread tls;  // unused by SFP, which is stateless
+                for (size_t r = begin; r < end; ++r) {
+                  const PackedSpan<SfpStream> row{
+                      HWY_RCAST_ALIGNED(SfpStream*, mat.RowBytes(r)), cols};
+                  HWY_NAMESPACE::Compress(raw + (r - begin) * cols, cols, tls,
+                                          row,
+                                          /*packed_ofs=*/0);
+                }
+              });
+
+  mat.SetScale(scale);
+}
+
+void weights_internal::ReadAllToSFP(const std::vector<TensorToRead>& tensors,
+                                    const BlobReader& reader,
+                                    ThreadingContext& ctx) {
+  PROFILER_ZONE("Startup.Weights.ReadAllToSFP");
+  // Usually a single (large) tensor, hence parallelize within, not across.
+  for (const TensorToRead& tensor : tensors) {
+    // CompressToSFP derives read sizes from the tensor shape. Ensure those
+    // reads cannot cross the blob boundary if metadata is inconsistent.
+    HWY_ASSERT_M(tensor.range.bytes == tensor.prev_packed_bytes,
+                 tensor.mat->Name());
+    switch (tensor.prev_type) {
+      case Type::kF32:
+        CompressToSFP<float>(tensor, reader, ctx);
+        break;
+      case Type::kBF16:
+        CompressToSFP<BF16>(tensor, reader, ctx);
+        break;
+      default:
+        HWY_ABORT("Unsupported type %s", TypeName(tensor.prev_type));
+    }
+  }
 }
 
 // Mode == kRead:
@@ -885,9 +1069,8 @@ static std::vector<IOBatch> MakeBatches(
           "MISMATCH tensor %zu '%s': offset=%zu range.End()=%zu "
           "range.bytes=%zu rows=%zu cols=%zu elem=%zu packed=%d",
           i, tensors[i].mat->Name(), static_cast<size_t>(offset),
-          static_cast<size_t>(range.End()),
-          static_cast<size_t>(range.bytes), mat.Rows(), mat.Cols(),
-          mat.ElementBytes(), mat.IsPacked());
+          static_cast<size_t>(range.End()), static_cast<size_t>(range.bytes),
+          mat.Rows(), mat.Cols(), mat.ElementBytes(), mat.IsPacked());
     }
   }
 
@@ -941,13 +1124,20 @@ static MapPtr MapOrReadAll(std::vector<TensorToRead>& tensors,
     AllocateAndBindAll(tensors, *mode, mat_owners, ctx);
   }
 
+  // `MakeBatches` and `ReadAllToBF16` read into the destination rows, hence
+  // tensors that require a compression pass are handled separately.
+  std::vector<TensorToRead> to_sfp, rest;
+  for (const TensorToRead& tensor : tensors) {
+    (tensor.to_sfp ? to_sfp : rest).push_back(tensor);
+  }
+  if (!to_sfp.empty()) weights_internal::ReadAllToSFP(to_sfp, reader, ctx);
+
   if (*mode == WeightsPtrs::Mode::kReadBF16) {
-    ReadAllToBF16(tensors, reader, ctx);
+    ReadAllToBF16(rest, reader, ctx);
     return MapPtr();
   }
 
-  const std::vector<IOBatch> batches =
-      MakeBatches(tensors, reader.file_bytes());
+  const std::vector<IOBatch> batches = MakeBatches(rest, reader.file_bytes());
   ReadBatches(reader, batches, ctx);
   return MapPtr();
 }
@@ -967,9 +1157,7 @@ WeightsPtrs::Mode WeightsPtrs::ReadFromBlobs(const ModelStore& model,
   ForEachTensor(nullptr, nullptr, [&](const TensorArgs& t) HWY_ATTR {
     size_t key_idx;
     if (model.FindAndUpdateMatPtr(t.mat, key_idx)) {
-      const bool is_compressed = t.mat.GetType() == Type::kNUQ ||
-                                 t.mat.GetType() == Type::kI8 ||
-                                 t.mat.GetType() == Type::kQ4_0;
+      const bool is_compressed = IsCompressed(t.mat.GetType());
       const MatPadding padding =
           (is_compressed || (t.flags & TensorArgs::kPacked))
               ? MatPadding::kPacked
@@ -982,7 +1170,22 @@ WeightsPtrs::Mode WeightsPtrs::ReadFromBlobs(const ModelStore& model,
     HWY_ABORT("Tensor %s is required but not found in file.", t.mat.Name());
   });
 
-  Mode mode = ChooseMode(reader.file_bytes(), loader, inference, ctx.allocator);
+  Mode mode = weights_internal::ChooseMode(reader.file_bytes(), loader,
+                                           inference, ctx.allocator);
+
+  // Compressing the input embedding to SFP halves its footprint. For models
+  // with tied input/output embeddings, it also halves the weight bandwidth of
+  // the per-token logits MatMul.
+  if (loader.sfp_embedding == Tristate::kTrue) {
+    if (mode == Mode::kMap) {
+      HWY_WARN("Cannot have sfp_embedding && map, ignoring sfp_embedding.");
+    } else {
+      for (TensorToRead& tensor : tensors) {
+        if (tensor.mat == &embedder_input_embedding) tensor.to_sfp = true;
+      }
+    }
+  }
+
   mapped_ = MapOrReadAll(tensors, reader, &mode, mat_owners, ctx);
 
   {
