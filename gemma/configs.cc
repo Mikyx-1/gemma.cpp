@@ -19,6 +19,7 @@
 #include <stdio.h>
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,8 @@ static ModelConfig ConfigNoSSM() {
   config.scale_base_names = {"att_ein",    "qkv_ein",      "gr_lin_x_w",
                              "gr_lin_y_w", "gr_lin_out_w", "gr_gate_w",
                              "gating_ein", "linear_w"};
+  config.rope_theta = 10000.0f;
+  config.global_rope_theta = 1000000.0f;
   return config;
 }
 
@@ -47,6 +50,8 @@ static ModelConfig ConfigBaseGemmaV2() {
   config.final_cap = 30.0f;
   config.eos_id = 1;
   config.secondary_eos_id = 107;
+  config.rope_theta = 10000.0f;
+  config.global_rope_theta = 10000.0f;
   return config;
 }
 
@@ -217,6 +222,8 @@ static ModelConfig ConfigBaseGemmaV3() {
   config.final_cap = 0.0f;
   config.eos_id = 1;
   config.secondary_eos_id = 106;
+  config.rope_theta = 10000.0f;
+  config.global_rope_theta = 1000000.0f;
   return config;
 }
 
@@ -423,6 +430,7 @@ static ModelConfig ConfigGemma3_270M() {
   config.display_name = "Gemma3_270M";
   config.model = Model::GEMMA3_270M;
   config.wrapping = PromptWrapping::GEMMA_IT;
+  config.global_rope_theta = 10000.0f;
   config.model_dim = 640;
   config.vocab_size = kGemmaV3VocabSize;  // new vocab size / tokenizer
   config.max_seq_len = 32 * 1024;
@@ -444,6 +452,8 @@ static ModelConfig ConfigBaseGemmaV4() {
   config.eos_id = 1;
   config.secondary_eos_id = 106;
   config.vocab_size = 262208;
+  config.rope_theta = 10000.0f;
+  config.global_rope_theta = 1000000.0f;
   return config;
 }
 
@@ -579,6 +589,87 @@ static ModelConfig ConfigGemma4_2B() {
   return config;
 }
 
+static LayerConfig LayerConfigGemma4_E4B_Local(size_t model_dim) {
+  LayerConfig config;
+  config.model_dim = model_dim;
+  config.ff_hidden_dim = 10240;
+  config.heads = 8;
+  config.kv_heads = 2;
+  config.qkv_dim = 256;
+  config.optimized_gating = true;
+  config.post_norm = PostNormType::Scale;
+  config.activation = ActivationType::Gelu;
+  config.post_qk = PostQKType::NormLocalRope;
+  config.use_qk_norm = true;
+  config.norm_v = true;
+  config.ple_dim = 256;
+  return config;
+}
+
+static LayerConfig LayerConfigGemma4_E4B_Global(size_t model_dim) {
+  LayerConfig config = LayerConfigGemma4_E4B_Local(model_dim);
+  config.qkv_dim = 512;
+  return config;
+}
+
+static ModelConfig ConfigGemma4_E4B_LM() {
+  ModelConfig config = ConfigBaseGemmaV4();
+  config.display_name = "Gemma4_E4B_LM";
+  config.model = Model::GEMMA4_E4B_LM;
+  config.wrapping = PromptWrapping::GEMMA_IT;
+  config.model_dim = 2560;
+  config.vocab_size = kGemmaV3VocabSize;  // 262144
+  config.max_seq_len = 128 * 1024;
+  config.final_cap = 0.0f;
+  config.ple_dim = 256;
+  config.num_layers = 42;
+  config.use_global_timescale = true;
+  config.partial_rotary_factor = 0.25f;
+  config.query_scale = QueryScaleType::One;
+  LayerConfig local_config = LayerConfigGemma4_E4B_Local(config.model_dim);
+  config.layer_configs = {config.num_layers, local_config};
+  // Global attention layers: [5, 11, 17, 23, 29, 35, 41] (stride 6)
+  for (size_t i = 0; i < config.num_layers; ++i) {
+    if (i % 6 == 5) {
+      config.layer_configs[i] = LayerConfigGemma4_E4B_Global(config.model_dim);
+    }
+  }
+  // KV-shared layers 24-41
+  for (size_t i = 24; i < config.num_layers; ++i) {
+    config.layer_configs[i].kv_share_layer_idx = (i % 6 == 5) ? 23 : 22;
+  }
+  config.attention_window_sizes = RepeatedAttentionWindowSizes<42, 6>(
+      {512, 512, 512, 512, 512, config.max_seq_len});
+  return config;
+}
+
+static ModelConfig ConfigGemma4_E4B() {
+  ModelConfig config = ConfigGemma4_E4B_LM();
+  config.display_name = "Gemma4_E4B";
+  config.model = Model::GEMMA4_E4B;
+  config.wrapping = PromptWrapping::GEMMA_IT;
+  config.use_global_timescale = true;
+
+  config.vit_config.model_dim = 768;
+  config.vit_config.patch_width = 16;
+  config.vit_config.seq_len = 2520;
+  config.vit_config.pool_dim = 3;
+  config.vit_config.image_size = 896;
+
+  LayerConfig vit_layer;
+  vit_layer.model_dim = 768;
+  vit_layer.ff_hidden_dim = 3072;
+  vit_layer.heads = 12;
+  vit_layer.kv_heads = 12;
+  vit_layer.qkv_dim = 64;
+  vit_layer.type = LayerAttentionType::kVitGemma4;
+  vit_layer.use_qk_norm = true;
+  vit_layer.post_norm = PostNormType::Scale;
+
+  config.vit_config.layer_configs = {16, vit_layer};
+  return config;
+}
+
 static LayerConfig LayerConfigDeepSeek4_Flash(size_t model_dim) {
   LayerConfig config;
   config.model_dim = model_dim;
@@ -670,6 +761,7 @@ static ModelConfig ConfigDeepSeek4_Flash() {
   config.attention_window_sizes = FixedAttentionWindowSizes<43>(128);
 
   config.rope_theta = 10000.0f;
+  config.global_rope_theta = 10000.0f;
   config.compress_rope_theta = 160000.0f;
   config.yarn_orig_seq_len = 65536;
   config.yarn_factor = 16.0f;
@@ -700,6 +792,8 @@ static ModelConfig ConfigBaseT5Gemma() {
   config.final_cap = 30.0f;
   config.eos_id = 1;
   config.secondary_eos_id = 107;
+  config.rope_theta = 10000.0f;
+  config.global_rope_theta = 10000.0f;
   return config;
 }
 
@@ -774,6 +868,8 @@ static ModelConfig ConfigQwen3_600M() {
   config.display_name = "Qwen3_0.6B";
   config.model = Model::QWEN3_600M;
   config.wrapping = PromptWrapping::GEMMA_IT;
+  config.rope_theta = 1000000.0f;
+  config.global_rope_theta = 1000000.0f;
   config.model_dim = 1024;
 
   LayerConfig layer_config =
@@ -792,6 +888,8 @@ static ModelConfig ConfigQwen3_2B() {
   config.display_name = "Qwen3_1.7B";
   config.model = Model::QWEN3_2B;
   config.wrapping = PromptWrapping::GEMMA_IT;
+  config.rope_theta = 1000000.0f;
+  config.global_rope_theta = 1000000.0f;
   config.model_dim = 2048;
 
   LayerConfig layer_config =
@@ -810,6 +908,8 @@ static ModelConfig ConfigQwen3_4B() {
   config.display_name = "Qwen3_4B";
   config.model = Model::QWEN3_4B;
   config.wrapping = PromptWrapping::GEMMA_IT;
+  config.rope_theta = 1000000.0f;
+  config.global_rope_theta = 1000000.0f;
   config.model_dim = 2560;
 
   LayerConfig layer_config =
@@ -871,6 +971,10 @@ static ModelConfig ConfigFromModel(Model model) {
       return ConfigQwen3_4B();
     case Model::GEMMA4_2B_LM:
       return ConfigGemma4_2B_LM();
+    case Model::GEMMA4_E4B:
+      return ConfigGemma4_E4B();
+    case Model::GEMMA4_E4B_LM:
+      return ConfigGemma4_E4B_LM();
     default:
       HWY_ABORT("Model type %d unknown.", static_cast<int>(model));
   }
@@ -926,6 +1030,10 @@ const char* ModelPrefix(Model model) {
       return "qwen3-4b";
     case Model::GEMMA4_2B_LM:
       return "gemma4-2b-lm";
+    case Model::GEMMA4_E4B:
+      return "gemma4-e4b";
+    case Model::GEMMA4_E4B_LM:
+      return "gemma4-e4b-lm";
     default:
       HWY_ABORT("Model type %d unknown.", static_cast<int>(model));
   }
@@ -1084,6 +1192,8 @@ bool ModelConfig::TestEqual(const ModelConfig& other, bool print) const {
   b.eos_id = a.eos_id;
   b.secondary_eos_id = a.secondary_eos_id;
   b.scale_base_names = a.scale_base_names;
+  b.rope_theta = a.rope_theta;
+  b.global_rope_theta = a.global_rope_theta;
   for (size_t i = 0; i < b.layer_configs.size(); ++i) {
     b.layer_configs[i].optimized_gating = a.layer_configs[i].optimized_gating;
   }
@@ -1107,6 +1217,10 @@ bool ModelConfig::OverwriteWithCanonical() {
   return found;
 }
 
+static inline bool StrContains(std::string_view str, std::string_view substr) {
+  return str.find(substr) != std::string_view::npos;  // NOLINT
+}
+
 Model DeduceModel(const Path& blob_path, size_t layers, int layer_types) {
   switch (layers) {
     case 8:
@@ -1128,8 +1242,8 @@ Model DeduceModel(const Path& blob_path, size_t layers, int layer_types) {
       return (layer_types & kDeduced448) ? Model::PALIGEMMA2_3B_448
                                          : Model::PALIGEMMA2_3B_224;
     case 28:
-      if (blob_path.path.find("qwen3-2b") != std::string::npos ||
-          blob_path.path.find("qwen3-1_7b") != std::string::npos) {
+      if (StrContains(blob_path.path, "qwen3-2b") ||
+          StrContains(blob_path.path, "qwen3-1_7b")) {
         return Model::QWEN3_2B;
       }
       return Model::QWEN3_600M;
@@ -1147,8 +1261,16 @@ Model DeduceModel(const Path& blob_path, size_t layers, int layer_types) {
       return Model::QWEN3_4B;
     case 42:
       if (layer_types & kDeducedViT) {
+        if (StrContains(blob_path.path, "gemma4") ||
+            StrContains(blob_path.path, "e4b")) {
+          return Model::GEMMA4_E4B;
+        }
         return (layer_types & kDeduced448) ? Model::PALIGEMMA2_10B_448
                                            : Model::PALIGEMMA2_10B_224;
+      }
+      if (StrContains(blob_path.path, "gemma4") ||
+          StrContains(blob_path.path, "e4b")) {
+        return Model::GEMMA4_E4B_LM;
       }
       return Model::GEMMA2_9B;
     case 46:

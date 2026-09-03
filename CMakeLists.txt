@@ -85,7 +85,7 @@ endif()
 
 ## Note: absl needs to be installed by sentencepiece. This will only happen if
 ## cmake is invoked with -DSPM_ENABLE_SHARED=OFF and -DSPM_ABSL_PROVIDER=module
-gemma_fetch(sentencepiece GIT_REPOSITORY https://github.com/google/sentencepiece GIT_TAG 9045b2f60fa2b323dfac0eaef8fc17565036f9f9 EXCLUDE_FROM_ALL)
+gemma_fetch(sentencepiece GIT_REPOSITORY https://github.com/google/sentencepiece GIT_TAG e0cce7d37b065b5140349dbe12c6bcf6192fdd78 EXCLUDE_FROM_ALL)
 
 gemma_fetch(json GIT_REPOSITORY https://github.com/nlohmann/json.git GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03 EXCLUDE_FROM_ALL)
 
@@ -156,6 +156,7 @@ set(SOURCES
   compression/compress-inl.h
   compression/compress.cc
   compression/compress.h
+  compression/mxfp4-inl.h
   compression/nuq-inl.h
   compression/q4_0-inl.h
   compression/sfp-inl.h
@@ -205,6 +206,7 @@ set(SOURCES
   gemma/vit.h
   gemma/weights.cc
   gemma/weights.h
+  gemma/weights_internal.h
   io/blob_store.cc
   io/blob_store.h
   io/fields.cc
@@ -217,6 +219,7 @@ set(SOURCES
   ops/gilbert.h
   ops/matmul_static_bf16.cc
   ops/matmul_static_f32.cc
+  ops/matmul_static_mxfp4.cc
   ops/matmul_static_nuq.cc
   ops/matmul_static_sfp.cc
   ops/matmul_static_i8.cc
@@ -354,6 +357,16 @@ target_link_libraries(benchmarks libgemma hwy hwy_contrib nlohmann_json::nlohman
 add_executable(debug_prompt evals/debug_prompt.cc)
 target_link_libraries(debug_prompt libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
 
+add_library(model_comparison evals/model_comparison.cc)
+target_include_directories(model_comparison PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(model_comparison_test evals/model_comparison_test.cc)
+target_link_libraries(model_comparison_test model_comparison)
+
+add_executable(gemma_mmlu evals/run_mmlu.cc)
+target_link_libraries(gemma_mmlu libgemma model_comparison hwy hwy_contrib
+                      nlohmann_json::nlohmann_json)
+
 ## Tests
 set(GEMMA_ENABLE_TESTS OFF CACHE BOOL "Enable Gemma tests")
 if (GEMMA_ENABLE_TESTS)
@@ -374,12 +387,14 @@ target_compile_definitions(libgemma PRIVATE HWY_IS_TEST=1)
 set(GEMMA_TEST_FILES
   compression/compress_test.cc
   compression/distortion_test.cc
+  compression/mxfp4_test.cc
   compression/nuq_test.cc
   compression/q4_0_test.cc
   compression/sfp_test.cc
   deepseek/deepseek_test.cc
   gemma/gemma_args_test.cc
   gemma/tensor_info_test.cc
+  gemma/weights_test.cc
   io/blob_store_test.cc
   io/fields_test.cc
   ops/bench_matmul.cc
@@ -439,6 +454,27 @@ target_link_libraries(gemma_batch_bench libgemma GTest::Main hwy hwy_contrib nlo
 endif()  # GEMMA_ENABLE_TESTS
 
 ## Tools
+
+# Standalone W8A8 vs BF16 MatMul benchmark (no gtest). The _biased variant
+# forces the encoding x86 uses, to show what the bias correction costs.
+add_executable(bench_matmul_i8 ops/bench_matmul_i8.cc)
+target_link_libraries(bench_matmul_i8 libgemma hwy hwy_contrib)
+
+add_executable(bench_matmul_i8_biased ops/bench_matmul_i8.cc)
+target_compile_definitions(bench_matmul_i8_biased PRIVATE
+                           GEMMA_MM_I8_FORCE_BIASED_B=1)
+target_link_libraries(bench_matmul_i8_biased libgemma hwy hwy_contrib)
+
+# W8A8 correctness, built once per A encoding so that the x86 biased-u8 path
+# is covered on non-x86 hosts as well.
+add_executable(matmul_i8_test ops/matmul_i8_test.cc)
+target_compile_definitions(matmul_i8_test PRIVATE GEMMA_MM_I8_FORCE_BIASED_B=0)
+target_link_libraries(matmul_i8_test libgemma hwy hwy_contrib)
+
+add_executable(matmul_i8_biased_test ops/matmul_i8_test.cc)
+target_compile_definitions(matmul_i8_biased_test PRIVATE
+                           GEMMA_MM_I8_FORCE_BIASED_B=1)
+target_link_libraries(matmul_i8_biased_test libgemma hwy hwy_contrib)
 
 add_executable(migrate_weights io/migrate_weights.cc)
 target_link_libraries(migrate_weights libgemma hwy hwy_contrib)
