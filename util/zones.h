@@ -66,6 +66,7 @@ enum class Zones {   // Keep sorted
   kOpsRopeAndMulBy,
   kOpsSoftmax,
   kStartupWeightsReadAllToBF16,
+  kStartupWeightsReadAllToSFP,
   kStartupWeightsReadBatches,
   kNumZones  // must be last
 };
@@ -100,6 +101,7 @@ enum class Callers {  // Keep sorted
   kMMClusterForMCNC,
   kMMClusterForN,
   kMMClusterForSFC,
+  kMMQuantizeA,
   kMMHierForMC,
   kMMHierForMCNC,
   kMMHierForN,
@@ -116,6 +118,7 @@ enum class Callers {  // Keep sorted
   kOpsRMSNormInplaceBatched,
   kOpsRMSNormNoScaleInplaceBatched,
   kReadAllToBF16,
+  kReadAllToSFP,
   kReadBatches,
   kSampleAndStream,
   kTensorStats,

@@ -291,6 +291,7 @@ enum class Model {
   GEMMA3_27B_LM,
   GEMMA4_26B_MOE,
   GEMMA4_2B,
+  GEMMA4_E2B = GEMMA4_2B,
   DEEPSEEK4_FLASH,
   // T5Gemma family - starting with S/S.
   T5GEMMA_S_S,
@@ -298,6 +299,9 @@ enum class Model {
   QWEN3_2B,  // 1.7B rounded up for readability.
   QWEN3_4B,
   GEMMA4_2B_LM,
+  GEMMA4_E2B_LM = GEMMA4_2B_LM,
+  GEMMA4_E4B,
+  GEMMA4_E4B_LM,
   kSentinel,
 };
 
@@ -673,6 +677,8 @@ struct ModelConfig : public IFields {
       visitor(decoder_attention_window_sizes);
     }
 
+    visitor(global_rope_theta);
+
     // Append new fields here, then update `python/configs.cc`.
   }
 
@@ -850,6 +856,9 @@ struct ModelConfig : public IFields {
 
   // RoPE base frequency for the raw/sliding-window attention path.
   float rope_theta = 10000.0f;
+  // RoPE base frequency for global attention layers. Appended to VisitFields
+  // for serialization compatibility.
+  float global_rope_theta = 1000000.0f;
   // DeepSeek V4: separate base frequency for compressed-attention layers
   // (query, window keys and compressed keys all use this on those layers).
   // 0 = same as rope_theta.
