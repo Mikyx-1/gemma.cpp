@@ -1,0 +1,29 @@
+2026-09-06T11:00:26.6675437Z CMake Error at CMakeLists.txt:15 (cmake_minimum_required):
+2026-09-06T11:00:26.6676234Z   Invalid CMAKE_POLICY_VERSION_MINIMUM value "3".  A numeric
+2026-09-06T11:00:26.6676679Z   major.minor[.patch[.tweak]] must be given.
+2026-09-06T11:00:26.6676960Z
+2026-09-06T11:00:26.6676965Z
+2026-09-06T11:00:26.7112486Z CMake Error at C:/Program Files/CMake/share/cmake-4.4/Modules/FetchContent.cmake:1144 (cmake_policy):
+2026-09-06T11:00:26.7113435Z   Invalid CMAKE_POLICY_VERSION_MINIMUM value "3".  A numeric
+2026-09-06T11:00:26.7114027Z   major.minor[.patch[.tweak]] must be given.
+2026-09-06T11:00:26.7114515Z Call Stack (most recent call first):
+2026-09-06T11:00:26.7114932Z   CMakeLists.txt:17 (include)
+2026-09-06T11:00:26.7115179Z
+2026-09-06T11:00:26.7115185Z
+2026-09-06T11:00:26.7284626Z CMake Error at C:/Program Files/CMake/share/cmake-4.4/Modules/ExternalProject/shared_internal_commands.cmake:1 (cmake_policy):
+2026-09-06T11:00:26.7285674Z   Invalid CMAKE_POLICY_VERSION_MINIMUM value "3".  A numeric
+2026-09-06T11:00:26.7286055Z   major.minor[.patch[.tweak]] must be given.
+2026-09-06T11:00:26.7286339Z Call Stack (most recent call first):
+2026-09-06T11:00:26.7286728Z   C:/Program Files/CMake/share/cmake-4.4/Modules/FetchContent.cmake:1146 (include)
+2026-09-06T11:00:26.7287135Z   CMakeLists.txt:17 (include)
+2026-09-06T11:00:26.7287290Z
+2026-09-06T11:00:26.7287293Z
+2026-09-06T11:00:26.8581427Z CMake Error at CMakeLists.txt:19 (project):
+2026-09-06T11:00:26.8581977Z   Generator
+2026-09-06T11:00:26.8582113Z
+2026-09-06T11:00:26.8582221Z     Visual Studio 17 2022
+2026-09-06T11:00:26.8582411Z
+2026-09-06T11:00:26.8582548Z   could not find any instance of Visual Studio.
+2026-09-06T11:00:26.8582810Z
+2026-09-06T11:00:26.8582814Z
+2026-09-06T11:00:26.8582817Z

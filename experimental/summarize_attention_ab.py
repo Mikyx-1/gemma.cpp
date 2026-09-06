@@ -2,7 +2,6 @@
 """Summarize attention_ab.py data without discarding trials or conflating metrics."""
 import argparse
 import json
-import math
 from pathlib import Path
 from statistics import mean, median
 
@@ -12,7 +11,17 @@ def span(values):
 
 
 def summarize(folder):
+    manifest = json.loads((folder / "manifest.json").read_text())
+    if "finished_utc" not in manifest:
+        raise ValueError("The matrix has not finished; do not summarize partial data")
     rows = [json.loads(line) for line in (folder / "results.jsonl").read_text().splitlines()]
+    identities = [(r["model"], r["phase"], r["case"], r["pair"], r["variant"]) for r in rows]
+    if len(set(identities)) != len(identities):
+        raise ValueError("Duplicate trials in results")
+    expected = 2 + 2 * manifest["prefill_pairs"] + 2 * manifest["decode_pairs"] + 4 + 6 * manifest["quality_pairs"]
+    for model in {r["model"] for r in rows}:
+        if sum(r["model"] == model for r in rows) != expected:
+            raise ValueError(f"Incomplete trial count for {model}")
     failed = [r for r in rows if r["returncode"]]
     if failed:
         raise ValueError(f"{len(failed)} failed runs: inspect raw results")

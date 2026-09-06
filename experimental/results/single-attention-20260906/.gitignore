@@ -1,0 +1,3 @@
+# Full console logs remain local; measurements, token probabilities, output text,
+# and hashes of these logs are retained in results.jsonl.
+logs/

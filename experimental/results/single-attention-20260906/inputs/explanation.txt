@@ -1,0 +1,1 @@
+Explain why floating-point addition is not associative. Give a numerical example and explain the consequences for reproducible programs.

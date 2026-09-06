@@ -1,0 +1,25 @@
+Running main() from /home/lehoangviet/Desktop/python_projects/gemma.cpp/build/_deps/highway-build/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from FlashAttentionTestGroup/FlashAttentionTest
+[ RUN      ] FlashAttentionTestGroup/FlashAttentionTest.TestAttention/AVX2
+FlashAttention: target_parallelism=8192, kNF=8, kVTileSize=1
+FlashAttention: target_parallelism=2048, kNF=8, kVTileSize=4
+FlashAttention: target_parallelism=256, kNF=8, kVTileSize=8
+[       OK ] FlashAttentionTestGroup/FlashAttentionTest.TestAttention/AVX2 (432 ms)
+[ RUN      ] FlashAttentionTestGroup/FlashAttentionTest.TestAttention/EMU128
+FlashAttention: target_parallelism=8192, kNF=4, kVTileSize=1
+FlashAttention: target_parallelism=2048, kNF=4, kVTileSize=4
+FlashAttention: target_parallelism=256, kNF=4, kVTileSize=4
+[       OK ] FlashAttentionTestGroup/FlashAttentionTest.TestAttention/EMU128 (684 ms)
+[ RUN      ] FlashAttentionTestGroup/FlashAttentionTest.TestSingleAttentionReference/AVX2
+Single-row attention error vs double: absolute 0.00732421875, scaled 2.86101204e-06
+[       OK ] FlashAttentionTestGroup/FlashAttentionTest.TestSingleAttentionReference/AVX2 (125 ms)
+[ RUN      ] FlashAttentionTestGroup/FlashAttentionTest.TestSingleAttentionReference/EMU128
+Single-row attention error vs double: absolute 0.00732421875, scaled 2.86101204e-06
+[       OK ] FlashAttentionTestGroup/FlashAttentionTest.TestSingleAttentionReference/EMU128 (172 ms)
+[----------] 4 tests from FlashAttentionTestGroup/FlashAttentionTest (1414 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (1414 ms total)
+[  PASSED  ] 4 tests.

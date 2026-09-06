@@ -1,0 +1,98 @@
+{
+  "started_utc": "2026-09-06T10:32:11Z",
+  "runner_command": [
+    "experimental/attention_ab.py",
+    "--base",
+    "build/attention-ab/base",
+    "--candidate",
+    "build/attention-ab/candidate",
+    "--base-revision",
+    "3ed403e28707c0e3eb5f48b0e487b63a446d8e2e",
+    "--candidate-revision",
+    "24a62021cecd67443589e408162731d742daed4f",
+    "--model",
+    "270m=270m-sfp-it.sbs",
+    "--model",
+    "1b=1b-it-sfp.sbs",
+    "--model",
+    "4b=4b-it-sfp.sbs",
+    "--output",
+    "experimental/results/single-attention-20260906"
+  ],
+  "base_revision": "3ed403e28707c0e3eb5f48b0e487b63a446d8e2e",
+  "candidate_revision": "24a62021cecd67443589e408162731d742daed4f",
+  "platform": "Linux-6.11.0-29-generic-x86_64-with-glibc2.39",
+  "cpu": "Architecture:                         x86_64\nCPU op-mode(s):                       32-bit, 64-bit\nAddress sizes:                        39 bits physical, 48 bits virtual\nByte Order:                           Little Endian\nCPU(s):                               12\nOn-line CPU(s) list:                  0-11\nVendor ID:                            GenuineIntel\nModel name:                           12th Gen Intel(R) Core(TM) i5-12400F\nCPU family:                           6\nModel:                                151\nThread(s) per core:                   2\nCore(s) per socket:                   6\nSocket(s):                            1\nStepping:                             2\nCPU(s) scaling MHz:                   20%\nCPU max MHz:                          4400.0000\nCPU min MHz:                          800.0000\nBogoMIPS:                             4992.00\nFlags:                                fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nVirtualization:                       VT-x\nL1d cache:                            288 KiB (6 instances)\nL1i cache:                            192 KiB (6 instances)\nL2 cache:                             7.5 MiB (6 instances)\nL3 cache:                             18 MiB (1 instance)\nNUMA node(s):                         1\nNUMA node0 CPU(s):                    0-11\nVulnerability Gather data sampling:   Not affected\nVulnerability Itlb multihit:          Not affected\nVulnerability L1tf:                   Not affected\nVulnerability Mds:                    Not affected\nVulnerability Meltdown:               Not affected\nVulnerability Mmio stale data:        Not affected\nVulnerability Reg file data sampling: Not affected\nVulnerability Retbleed:               Not affected\nVulnerability Spec rstack overflow:   Not affected\nVulnerability Spec store bypass:      Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:             Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:             Mitigation; Enhanced / Automatic IBRS; IBPB conditional; RSB filling; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                  Not affected\nVulnerability Tsx async abort:        Not affected",
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "cmake": "cmake version 3.28.3\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+  "threads": 12,
+  "seq_len": 8192,
+  "ram_reserve_gib": 1.5,
+  "ram_sample_interval_seconds": 0.25,
+  "prefill_pairs": 5,
+  "decode_pairs": 3,
+  "quality_pairs": 3,
+  "artifacts": {
+    "270m-sfp-it.sbs": {
+      "bytes": 440664064,
+      "sha256": "2c040a83d64f354e9459d4fc5fd855d8bc0640bee2b6e2a563ca17939730929d"
+    },
+    "1b-it-sfp.sbs": {
+      "bytes": 1306787840,
+      "sha256": "f5cb958c562ceacbd91e734196142796825a9033c726bdab04711f023f639b35"
+    },
+    "4b-it-sfp.sbs": {
+      "bytes": 5401208832,
+      "sha256": "4fc6335cd98cb0b16b0c2b94d76e0b498492970f8175f782a887afbb511aa731"
+    },
+    "/home/lehoangviet/Desktop/python_projects/gemma.cpp/tokenizer.spm": {
+      "bytes": 4689074,
+      "sha256": "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c"
+    },
+    "/home/lehoangviet/Desktop/python_projects/gemma.cpp/build/attention-ab/base/gemma": {
+      "bytes": 12388840,
+      "sha256": "bc11c5a7a08f1cf9354e1d2830106b3e97a9e1b4f902497cfe8ddc59b56e37ac"
+    },
+    "/home/lehoangviet/Desktop/python_projects/gemma.cpp/build/attention-ab/base/single_benchmark": {
+      "bytes": 12475600,
+      "sha256": "1291a66322f1cc863376b8149147a58abacfe1c7a93aba655b40b041c89d67db"
+    },
+    "/home/lehoangviet/Desktop/python_projects/gemma.cpp/build/attention-ab/candidate/gemma": {
+      "bytes": 12392936,
+      "sha256": "b9c989e3fa426188e17bdaa295d1873476f7ba5056dcd94505f0eccee05d05a2"
+    },
+    "/home/lehoangviet/Desktop/python_projects/gemma.cpp/build/attention-ab/candidate/single_benchmark": {
+      "bytes": 12475600,
+      "sha256": "f71021bd130da0989f97edafb12a3ca19e8bcabfe315b575c5577241a2684247"
+    },
+    "experimental/results/single-attention-20260906/inputs/explanation.txt": {
+      "bytes": 136,
+      "sha256": "e6ba14046106c324ab8fd7e3523dc84e24a955a0f0f49aec9128b1b2f3b225ca"
+    },
+    "experimental/results/single-attention-20260906/inputs/long.txt": {
+      "bytes": 15938,
+      "sha256": "19886f23b27c4e95eafd949c8a320f5bb4b5da088e98bc921ef179933c10ae2a"
+    },
+    "experimental/results/single-attention-20260906/inputs/technical.txt": {
+      "bytes": 1055,
+      "sha256": "7c8706e89316a541990061f3aafb4a94f8d5980987a2ffab356d30f57fdcda2a"
+    },
+    "experimental/results/single-attention-20260906/inputs/frankenstein_chap4.txt": {
+      "bytes": 1026,
+      "sha256": "e2d429e2234a169cad15c456363a52f0cd0b5e99af3519da0d526deb9d04a1d3"
+    },
+    "experimental/results/single-attention-20260906/inputs/frankenstein_chap1.txt": {
+      "bytes": 1026,
+      "sha256": "be1067f06ac952a7688bcc0c4477fd19f32b609ebcebe49fec2f0ec21b7bf4ae"
+    },
+    "experimental/results/single-attention-20260906/inputs/code.txt": {
+      "bytes": 127,
+      "sha256": "4bb331b843088b84fbd75c7b03c15649e7f27bda85e231beacff3215fdcaedf8"
+    },
+    "/home/lehoangviet/Desktop/python_projects/gemma.cpp/experimental/attention_ab.py": {
+      "bytes": 11081,
+      "sha256": "8f73971f55473c89a18ba696e098855ce6d62e115fad145a2ded69d18b242c64"
+    }
+  },
+  "finished_utc": "2026-09-06T11:43:19Z"
+}
