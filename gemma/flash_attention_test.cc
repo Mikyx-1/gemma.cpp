@@ -164,6 +164,92 @@ void TestFlashAttention(size_t target_parallelism) {
   ctx.profiler.PrintResults();
 }
 
+// Exercise the single-row accumulator directly, including circular KV windows
+// and score orders that repeatedly change (or never change) the running max.
+// The oracle materializes softmax in double precision, independently of either
+// online recurrence. Scores and values are exactly representable as floats.
+void TestSingleAttentionReference() {
+  ThreadingArgs threading_args;
+  threading_args.max_threads = 1;
+  ThreadingContext ctx(threading_args);
+  constexpr size_t kSeqLen = 8192;
+  ModelConfig config(Model::GEMMA2_2B, Type::kF32, PromptWrapping::GEMMA_PT);
+  TensorInfoRegistry registry(config);
+  const LayerConfig& layer_config = config.layer_configs[0];
+  const LayerWeightsPtrs layer(0, layer_config, registry);
+  std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>> row_ptrs;
+  AttentionActivations attention(config, layer_config, 1, kSeqLen,
+                                 ctx.allocator, row_ptrs);
+  const size_t dim = layer_config.qkv_dim;
+  MatStorageT<KV_t> k("k", Extents2D(kSeqLen, dim), ctx.allocator,
+                      MatPadding::kOdd);
+  MatStorageT<KV_t> v("v", Extents2D(kSeqLen, dim), ctx.allocator,
+                      MatPadding::kOdd);
+  std::vector<float> q(dim, 0.0f), output(dim);
+  q[0] = 1.0f;
+  double max_abs_error = 0.0;
+  double max_scaled_error = 0.0;
+  for (float cap : {0.0f, 50.0f}) {
+    config.att_cap = cap;
+    for (size_t length : {size_t{1}, size_t{2}, size_t{17}, size_t{129},
+                          size_t{1024}, kSeqLen}) {
+      for (size_t start : {size_t{0}, kSeqLen - 7}) {
+        for (int pattern = 0; pattern < 7; ++pattern) {
+          std::vector<double> scores(length);
+          for (size_t i = 0; i < length; ++i) {
+            const size_t row = (start + i) % kSeqLen;
+            std::fill(k.Row(row), k.Row(row) + dim, 0.0f);
+            float score = -1000.0f;  // tied, very negative scores
+            if (pattern == 1) score = static_cast<float>(i) / 4.0f - 120.0f;
+            if (pattern == 2) score = 120.0f - static_cast<float>(i) / 4.0f;
+            if (pattern == 3) score = (i % 2 == 0) ? -1000.0f : 1000.0f;
+            if (pattern == 4)
+              score = (static_cast<int>(i * 73 % 257) - 128) / 8.0f;
+            k.Row(row)[0] = score;
+            // Match the float soft cap, then evaluate softmax in double.
+            scores[i] = cap > 0.0f ? cap * std::tanh(score / cap) : score;
+            for (size_t c = 0; c < dim; ++c) {
+              float value =
+                  (static_cast<int>((i * 13 + c * 7) % 101) - 50) / 32.0f;
+              if (pattern == 5) value = static_cast<float>(i) + c / 1024.0f;
+              if (pattern == 6) value = 1024.0f + c / 1024.0f;
+              v.Row(row)[c] = value;
+            }
+          }
+          const double max_score =
+              *std::max_element(scores.begin(), scores.end());
+          double denominator = 0.0;
+          std::vector<double> expected(dim, 0.0);
+          for (size_t i = 0; i < length; ++i) {
+            const double weight = std::exp(scores[i] - max_score);
+            denominator += weight;
+            const size_t row = (start + i) % kSeqLen;
+            for (size_t c = 0; c < dim; ++c) {
+              expected[c] += weight * v.Row(row)[c];
+            }
+          }
+          SingleFlashAttention(start, start + length - 1, q.data(), k, v, 0,
+                               layer, attention, output.data(), ctx, 0);
+          for (size_t c = 0; c < dim; ++c) {
+            expected[c] /= denominator;
+            const double error = std::abs(output[c] - expected[c]);
+            max_abs_error = std::max(max_abs_error, error);
+            max_scaled_error = std::max(
+                max_scaled_error, error / std::max(1.0, std::abs(expected[c])));
+            EXPECT_TRUE(std::isfinite(output[c]));
+            EXPECT_NEAR(output[c], expected[c],
+                        2e-5 + 2e-5 * std::abs(expected[c]))
+                << "length=" << length << " start=" << start << " cap=" << cap
+                << " pattern=" << pattern << " col=" << c;
+          }
+        }
+      }
+    }
+  }
+  printf("Single-row attention error vs double: absolute %.9g, scaled %.9g\n",
+         max_abs_error, max_scaled_error);
+}
+
 void TestAttention() {
   TestFlashAttention(8192);
   TestFlashAttention(2048);
@@ -180,6 +266,7 @@ HWY_AFTER_NAMESPACE();
 namespace gcpp {
 HWY_BEFORE_TEST(FlashAttentionTest);
 HWY_EXPORT_AND_TEST_P(FlashAttentionTest, TestAttention);
+HWY_EXPORT_AND_TEST_P(FlashAttentionTest, TestSingleAttentionReference);
 HWY_AFTER_TEST();
 
 }  // namespace gcpp
