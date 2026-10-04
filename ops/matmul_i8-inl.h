@@ -1525,6 +1525,8 @@ static HWY_INLINE void MMI8PrepareInputRow(
   }
 }
 
+#include "ops/matmul_i8_typed_rotate-inl.h"
+
 // Quantizes all `M x K` of `A` into `storage`, in parallel over rows.
 // This replaces `MMDecompress::DecompressA` and is the same order of cost:
 // one pass over `A`, once per `MatMul` rather than per B tile.
@@ -1547,6 +1549,7 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
   float* HWY_RESTRICT scale = storage.scale();
   const float a_scale = A.Scale();
   static const bool match_bf16 = MMI8Flag("GEMMA_MM_I8_MATCH_BF16_A");
+  const bool typed_rotate = MMI8TypedRotateEnabled();
   HWY_DASSERT((k % MMI8RotateBlockSize()) == 0);
 
   ParallelFor(
@@ -1554,9 +1557,14 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
       [&](size_t r, size_t /*worker*/) HWY_ATTR {
         thread_local hwy::AlignedVector<float> rotated;
         if (rotated.size() < padded_k) rotated.resize(padded_k);
+        if (typed_rotate && MMI8TryTypedPrepareRotate(
+                A.Row(r), k, a_pre_scale, match_bf16, rotated.data(),
+                MMI8RotateBlockSize(), MMI8HashBits(), MMI8FastRotate())) {
+        } else {
         MMI8PrepareInputRow(A.Row(r), k, a_pre_scale, match_bf16,
                             rotated.data());
         MMI8Rotate(rotated.data(), k);
+        }
         const size_t group_size = block_size ? block_size : k;
         int32_t* prefix = storage.prefix(r);
         for (size_t c = 0; c < k; c += group_size) {
