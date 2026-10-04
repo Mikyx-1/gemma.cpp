@@ -1211,6 +1211,8 @@ static HWY_NOINLINE void ComputePLEEmbeddings(size_t tbatch_size,
 // Populates KV cache for batches of tokens from one query at a time. This is
 // called if prompts are longer than the query batch size, and also in
 // prefix-LM mode (end > 0), which must see all tokens in one batch.
+#include "gemma/prefill_last_kv-inl.h"
+
 static HWY_NOINLINE void PrefillTBatch(const ModelConfig& config,
                                        const RuntimeConfig& runtime_config,
                                        const WeightsPtrs& weights,
@@ -1308,6 +1310,10 @@ static HWY_NOINLINE void PrefillTBatch(const ModelConfig& config,
           tbatch_size, config, runtime_config, activations, qbatch_1, env);
       for (size_t layer_idx = 0; layer_idx < config.layer_configs.size();
            ++layer_idx) {
+        if (layer_idx + 1 == config.layer_configs.size() &&
+            TryPrefillLastLayerKV(tbatch_size, layer_idx, config, runtime_config,
+                                  weights, activations, qbatch_1, env))
+          continue;
         PrivateTransformerLayer(tbatch_size, layer_idx,
                                 *weights.GetLayer(layer_idx), activations,
                                 qbatch_1, env, fuse_prefill_rows);

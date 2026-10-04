@@ -69,6 +69,11 @@ inline void MaybeReshapeCache(const size_t default_cols, MatPtrT<KV_t>& cache) {
                       AttentionActivationsPtrs& activations, QBatch& qbatch,  \
                       MatMulEnv& env, AttentionImpl attention_impl,           \
                       int flags);                                             \
+  /* Final-layer token-prefill projection; caller guards flat KV. */         \
+  void GemmaPrefillKVOnly(size_t num_tokens, size_t layer_idx,                 \
+                          const LayerWeightsPtrs& layer,                     \
+                          AttentionActivationsPtrs& activations,             \
+                          QBatch& qbatch, MatMulEnv& env);                    \
   /* NOLINTNEXTLINE(google-readability-namespace-comments) */                 \
   }  // namespace NAMESPACE
 

@@ -172,6 +172,7 @@ void PositionalEncodingQK(float* qk, const size_t layer_idx,
 // number of tokens from one query: 1 for decode, otherwise prefill_tbatch_size.
 
 // Fills activations.q and writes to KV cache.
+template <bool kSkipQ = false>
 static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
                                   const LayerWeightsPtrs& layer,
                                   AttentionActivationsPtrs& activations,
@@ -201,8 +202,10 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
 
   // The original qkv_einsum_w has shape [(heads + kv_heads * 2), qkv_dim,
   // model_dim], which we reshaped to (heads + kv_heads * 2) * qkv_dim rows.
-  CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
-             /*add=*/nullptr, env, activations.q);
+  if constexpr (!kSkipQ) {
+    CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
+               /*add=*/nullptr, env, activations.q);
+  }
 
   if (skip_kv) return;
   // Set up MatMul row pointers for writing to KV, which consists of
@@ -321,6 +324,17 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
         // difficult to change, and it probably isn't significant.
         TransposeKVCacheRow(kv, k, v, qkv_dim);
       });
+}
+
+void GemmaPrefillKVOnly(size_t num_tokens, size_t layer_idx,
+                        const LayerWeightsPtrs& layer,
+                        AttentionActivationsPtrs& activations,
+                        QBatch& qbatch, MatMulEnv& env) {
+  HWY_DASSERT(qbatch.Size() == 1 && num_tokens != 0);
+  HWY_DASSERT(layer.layer_config.kv_share_layer_idx < 0);
+  HWY_DASSERT(!layer.layer_config.IsMHA());
+  ComputeQKV<true>(num_tokens, layer_idx, layer, activations, qbatch,
+                    /*flags=*/0, env);
 }
 
 void GemmaAttention(size_t num_tokens, const size_t layer_idx,
