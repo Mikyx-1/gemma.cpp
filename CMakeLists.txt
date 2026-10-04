@@ -375,6 +375,9 @@ target_link_libraries(convert_dsv4 libgemma hwy hwy_contrib nlohmann_json::nlohm
 add_executable(run_dsv4 deepseek/run_dsv4.cc)
 target_link_libraries(run_dsv4 libgemma hwy hwy_contrib)
 
+add_executable(spec_decode_bench evals/spec_decode_bench.cc)
+target_link_libraries(spec_decode_bench libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
+
 add_executable(single_benchmark evals/benchmark.cc)
 target_link_libraries(single_benchmark libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
 
