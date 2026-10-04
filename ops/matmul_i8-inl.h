@@ -493,6 +493,9 @@ class MMI8StoreHorizontalSumsIntoC {
         return hn::Add(hn::LowerHalf(d4, pairs), hn::UpperHalf(d4, pairs));
       };
       sum0 = reduce(C00, C01, C02, C03);
+      // Callers pass all four outputs by value even for one/two-row tiles.
+      // Match the generic reducer's zero values for unused output rows.
+      sum1 = sum2 = sum3 = hn::Zero(d4);
       if constexpr (kRowsAC > 1) sum1 = reduce(C10, C11, C12, C13);
       if constexpr (kRowsAC > 2) sum2 = reduce(C20, C21, C22, C23);
       if constexpr (kRowsAC > 3) sum3 = reduce(C30, C31, C32, C33);
@@ -613,6 +616,12 @@ class MMI8StoreHorizontalSumsIntoC {
     }
   }
 };  // MMI8StoreHorizontalSumsIntoC
+
+#include "ops/matmul_i8_micro_prefill-inl.h"
+#include "ops/matmul_i8_micro_prefill16-inl.h"
+#include "ops/matmul_i8_micro_tile-inl.h"
+#include "ops/matmul_i8_micro_prefill32-inl.h"
+#include "ops/matmul_i8_micro_prefill48-inl.h"
 
 //------------------------------------------------------------------------------
 // Kernel
@@ -831,8 +840,16 @@ class MMI8Kernel {
                                     CView C_MC_NR) {
     const hn::Full128<int32_t> d4i;
     hn::Vec<decltype(d4i)> sum0, sum1, sum2, sum3;
-    DotProducts<kRowsAC, kNative, false>(A_view, B_view, imc, kc, sum0, sum1,
-                                       sum2, sum3);
+    static const bool fast_reduce = MMI8Flag("GEMMA_MM_I8_FAST_REDUCE", true);
+    if (fast_reduce) {
+      // Integer additions can be regrouped without changing the final dot
+      // product. This avoids the generic stack transpose on AVX2.
+      DotProducts<kRowsAC, kNative, true>(A_view, B_view, imc, kc, sum0, sum1,
+                                          sum2, sum3);
+    } else {
+      DotProducts<kRowsAC, kNative, false>(A_view, B_view, imc, kc, sum0, sum1,
+                                           sum2, sum3);
+    }
 
     // Sums of the quantized `A` values over this `kc` range, for undoing `B`'s
     // bias. `A_view` is already restricted to the range, so `kc` is its width.
@@ -1019,6 +1036,20 @@ class MMI8Kernel {
                                              const IndexRange& range_nc,
                                              const MMArgs& args, Tag tag,
                                              CView C) {
+#if HWY_ARCH_X86_64
+    static const bool multi_row = MMI8Flag("GEMMA_MM_I8_MICRO_PREFILL", false);
+    if (multi_row && range_mc.Num() >= 2) {
+      static const bool wide = MMI8Flag("GEMMA_MM_I8_MICRO_PREFILL16", false);
+      if (wide) {
+        MMI8PackedMicroPrefill16<kBlock, kAlignedGroups, kDual>(
+            A, B, range_mc, range_kc, range_nc, args, tag, C);
+      } else {
+        MMI8PackedMicroPrefill<kBlock, kAlignedGroups, kDual>(
+            A, B, range_mc, range_kc, range_nc, args, tag, C);
+      }
+      return;
+    }
+#endif
     const hn::ScalableTag<int8_t> da;
     const hn::ScalableTag<uint8_t> db;
     const hn::Repartition<int32_t, decltype(da)> di;
@@ -1167,6 +1198,8 @@ class MMI8Kernel {
     PackedMicroReference(A, B, range_mc, range_kc, range_nc, args, tag, C);
   }
 
+ public:
+  // Dispatch packed microscaled operands through the selected prefill tile.
   template <typename BT, class Tag, class CView>
   static HWY_INLINE void PackedMicroB3A2C0(const AView& A, const BT& B,
                                            const IndexRange& range_mc,
@@ -1174,6 +1207,16 @@ class MMI8Kernel {
                                            const IndexRange& range_nc,
                                            const MMArgs& args, Tag tag,
                                            CView C) {
+#if HWY_TARGET == HWY_AVX2 && GEMMA_MM_I8_BIASED_B && defined(__GNUC__) && \
+    !defined(__clang__) && HWY_ARCH_X86_64
+    if (MMI8TryMicroPrefill48(A, B, range_mc, range_kc, range_nc, args, tag, C)) {
+      return;
+    }
+    if (range_mc.Num() >= 2 &&
+        MMI8TryMicroPrefill32(A, B, range_mc, range_kc, range_nc, args, tag, C)) {
+      return;
+    }
+#endif
     if (B.dual_a && A.residual != nullptr) {
       DispatchPackedMicro<true>(A, B, range_mc, range_kc, range_nc, args, tag,
                                 C);
@@ -1184,6 +1227,7 @@ class MMI8Kernel {
                                  tag, C);
     }
   }
+ private:
   template <bool kNative, typename BT, class Tag, class CView>
   static HWY_INLINE void DispatchMicroBlock(const AView& A, const BT& B,
                                             const IndexRange& range_mc,
@@ -1324,16 +1368,130 @@ static HWY_INLINE VF LoadNF32(DF df, const TA* HWY_RESTRICT p, size_t n) {
   }
 }
 
+// Optional exact scan of the already quantized signed bytes. No float
+// quantization or residual operation changes. Other targets use the scalar
+// loop. GEMMA_MM_I8_PREFIX_SCAN=8 or 16; absent/invalid/0 retains the scalar
+// default.
+static inline size_t MMI8PrefixScanMode() {
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86 && GEMMA_MM_I8_BIASED_B
+  static const size_t mode = []() -> size_t {
+    const char* value = getenv("GEMMA_MM_I8_PREFIX_SCAN");
+    if (value != nullptr && value[0] == '8' && value[1] == '\0') return 8;
+    if (value != nullptr && value[0] == '1' && value[1] == '6' &&
+        value[2] == '\0')
+      return 16;
+    return 0;
+  }();
+  return mode;
+#else
+  return 0;
+#endif
+}
+
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+static HWY_INLINE void MMI8PrefixScan8(const int8_t* input, size_t count,
+                                       int32_t base, int32_t* prefix) {
+  prefix[0] = base;
+  const __m256i last = _mm256_set1_epi32(7);
+  __m256i carry = _mm256_set1_epi32(base);
+  size_t i = 0;
+  for (; i + 8 <= count; i += 8) {
+    __m256i scan = _mm256_cvtepi8_epi32(
+        _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + i)));
+    // Two independent inclusive scans of four i32 elements each.
+    scan = _mm256_add_epi32(scan, _mm256_slli_si256(scan, 4));
+    scan = _mm256_add_epi32(scan, _mm256_slli_si256(scan, 8));
+    // Put the low-half total into all high-half lanes, zero in low lanes.
+    __m256i half = _mm256_permute2x128_si256(scan, scan, 0x08);
+    half = _mm256_shuffle_epi32(half, 0xff);
+    scan = _mm256_add_epi32(scan, half);
+    scan = _mm256_add_epi32(scan, carry);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(prefix + i + 1), scan);
+    carry = _mm256_permutevar8x32_epi32(scan, last);
+  }
+  if (i != count) {
+    int32_t sum = _mm256_extract_epi32(carry, 0);
+    for (; i < count; ++i) {
+      sum += input[i];
+      prefix[i + 1] = sum;
+    }
+  }
+}
+
+static HWY_INLINE void MMI8PrefixScan16(const int8_t* input, size_t count,
+                                        int32_t base, int32_t* prefix) {
+  prefix[0] = base;
+  const __m256i last = _mm256_set1_epi32(7);
+  __m256i carry = _mm256_set1_epi32(base);
+  size_t i = 0;
+  for (; i + 16 <= count; i += 16) {
+    __m256i scan = _mm256_cvtepi8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + i)));
+    // Each half has eight signed bytes: every partial sum is in
+    // [-1024,1016], safely representable in i16 even with input -128.
+    scan = _mm256_add_epi16(scan, _mm256_slli_si256(scan, 2));
+    scan = _mm256_add_epi16(scan, _mm256_slli_si256(scan, 4));
+    scan = _mm256_add_epi16(scan, _mm256_slli_si256(scan, 8));
+    __m256i low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(scan));
+    __m256i high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(scan, 1));
+    // Widen before adding the global carry, which may be near INT32 limits.
+    high = _mm256_add_epi32(high, _mm256_permutevar8x32_epi32(low, last));
+    low = _mm256_add_epi32(low, carry);
+    high = _mm256_add_epi32(high, carry);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(prefix + i + 1), low);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(prefix + i + 9), high);
+    carry = _mm256_permutevar8x32_epi32(high, last);
+  }
+  if (i != count) {
+    // Retains vector coverage for an 8..15 element tail and exact scalar
+    // behavior for smaller tails. The boundary prefix is rewritten equally.
+    MMI8PrefixScan8(input + i, count - i, _mm256_extract_epi32(carry, 0),
+                    prefix + i);
+  }
+}
+#endif
+
+#include "ops/matmul_i8_prefix_endpoints-inl.h"
+
+static HWY_INLINE void MMI8BuildPrefix(const int8_t* input, size_t count,
+                                       int32_t base, int32_t* prefix,
+                                       size_t mode) {
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+#if GEMMA_MM_I8_BIASED_B
+  if (mode == kMMI8PrefixEndpointsMode) {
+    if (MMI8PrefixEndpoints32(input, count, base, prefix)) return;
+    // Defensive direct-call fallback. Production routing admits whole groups.
+    mode = MMI8PrefixScanMode();
+  }
+#endif
+  if (mode == 16) {
+    MMI8PrefixScan16(input, count, base, prefix);
+    return;
+  }
+  if (mode == 8) {
+    MMI8PrefixScan8(input, count, base, prefix);
+    return;
+  }
+#else
+  (void)mode;
+#endif
+  int32_t sum = base;
+  prefix[0] = base;
+  for (size_t j = 0; j < count; ++j) {
+    sum += input[j];
+    prefix[j + 1] = sum;
+  }
+}
+
 // Quantizes one row of `k` activations to symmetric int8, returning the
 // dequantization scale. Also writes `k + 1` prefix sums of the quantized
 // values (when `B` is biased), which the kernel uses to undo that bias for
 // whichever `kc` range it is working on. `out` is zero-padded to `padded_k`.
 template <typename TA>
-static HWY_INLINE float QuantizeRowA(const TA* HWY_RESTRICT in, size_t k,
-                                     MMI8AT* HWY_RESTRICT out,
-                                     int32_t* HWY_RESTRICT prefix,
-                                     size_t padded_k,
-                                     int32_t prefix_base = 0) {
+static HWY_INLINE float QuantizeRowA(
+    const TA* HWY_RESTRICT in, size_t k, MMI8AT* HWY_RESTRICT out,
+    int32_t* HWY_RESTRICT prefix, size_t padded_k, int32_t prefix_base = 0,
+    size_t prefix_scan_mode = MMI8PrefixScanMode()) {
   const hn::ScalableTag<float> df;
   const hn::Rebind<int32_t, decltype(df)> di32;
   const hn::Rebind<MMI8AT, decltype(df)> d8;
@@ -1372,14 +1530,7 @@ static HWY_INLINE float QuantizeRowA(const TA* HWY_RESTRICT in, size_t k,
   }
 
   if constexpr (GEMMA_MM_I8_BIASED_B) {
-    // Scalar, but only `M * K` additions per MatMul, i.e. the same order as
-    // the quantization itself and negligible next to `M * K * N` products.
-    int32_t sum = prefix_base;
-    prefix[0] = prefix_base;
-    for (size_t j = 0; j < k; ++j) {
-      sum += out[j];
-      prefix[j + 1] = sum;
-    }
+    MMI8BuildPrefix(out, k, prefix_base, prefix, prefix_scan_mode);
   }
   return scale;
 }
@@ -1481,6 +1632,9 @@ static HWY_INLINE void MMI8PrepareInputRow(
   }
 }
 
+#include "ops/matmul_i8_typed_rotate-inl.h"
+#include "ops/matmul_i8_fused_quant-inl.h"
+
 // Quantizes all `M x K` of `A` into `storage`, in parallel over rows.
 // This replaces `MMDecompress::DecompressA` and is the same order of cost:
 // one pass over `A`, once per `MatMul` rather than per B tile.
@@ -1488,7 +1642,18 @@ template <typename TA>
 static HWY_NOINLINE MMI8AView
 QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
           size_t cluster_idx, const float* a_pre_scale = nullptr,
-          size_t block_size = 0, MMI8AView* residual = nullptr) {
+          size_t block_size = 0, MMI8AView* residual = nullptr,
+          size_t prefix_scan_mode = MMI8PrefixScanMode()) {
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+  if (MMI8FusedDualQuantEnabled() &&
+      MMI8FusedDualQuantSupported(A.Rows(), A.Cols(), block_size,
+                                   residual != nullptr)) {
+    const auto fused = MMI8QuantizeAFusedDual(
+        A, storage, ctx, cluster_idx, a_pre_scale, block_size, residual,
+        prefix_scan_mode);
+    return fused;
+  }
+#endif
   MMI8AView view = storage.View(A.Extents(), block_size);
   if (residual != nullptr) {
     *residual = storage.ResidualView(A.Extents(), block_size);
@@ -1503,6 +1668,7 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
   float* HWY_RESTRICT scale = storage.scale();
   const float a_scale = A.Scale();
   static const bool match_bf16 = MMI8Flag("GEMMA_MM_I8_MATCH_BF16_A");
+  const bool typed_rotate = MMI8TypedRotateEnabled();
   HWY_DASSERT((k % MMI8RotateBlockSize()) == 0);
 
   ParallelFor(
@@ -1510,16 +1676,21 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
       [&](size_t r, size_t /*worker*/) HWY_ATTR {
         thread_local hwy::AlignedVector<float> rotated;
         if (rotated.size() < padded_k) rotated.resize(padded_k);
+        if (typed_rotate && MMI8TryTypedPrepareRotate(
+                A.Row(r), k, a_pre_scale, match_bf16, rotated.data(),
+                MMI8RotateBlockSize(), MMI8HashBits(), MMI8FastRotate())) {
+        } else {
         MMI8PrepareInputRow(A.Row(r), k, a_pre_scale, match_bf16,
                             rotated.data());
         MMI8Rotate(rotated.data(), k);
+        }
         const size_t group_size = block_size ? block_size : k;
         int32_t* prefix = storage.prefix(r);
         for (size_t c = 0; c < k; c += group_size) {
           const int32_t base = GEMMA_MM_I8_BIASED_B && c ? prefix[c] : 0;
           const float raw_scale =
               QuantizeRowA(rotated.data() + c, group_size, view.data.Row(r) + c,
-                           prefix + c, group_size, base);
+                           prefix + c, group_size, base, prefix_scan_mode);
           scale[(c / group_size) * view.scale_stride + r] = a_scale * raw_scale;
           if (residual != nullptr) {
             const hn::CappedTag<float, 32> df;
@@ -1540,7 +1711,8 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
                                      r] =
                 a_scale * QuantizeRowA(rotated.data() + c, group_size,
                                        residual->data.Row(r) + c, rp + c,
-                                       group_size, residual_base);
+                                       group_size, residual_base,
+                                       prefix_scan_mode);
           }
         }
         for (size_t c = k; c < padded_k; ++c) {
@@ -1601,12 +1773,87 @@ static HWY_NOINLINE MMI8B PackB(const MatPtrT<float>& B_f32,
 //------------------------------------------------------------------------------
 // Entry point
 
+static inline bool MMI8ExactAutotune() {
+  static const bool enabled = MMI8Flag("GEMMA_MM_I8_EXACT_AUTOTUNE");
+  return enabled;
+}
+
+static inline bool MMI8SameKPartition(const MMConfig& a, const MMConfig& b,
+                                      size_t K) {
+  const auto ra = a.RangesOfKC(K);
+  const auto rb = b.RangesOfKC(K);
+  if (ra.NumTasks() != rb.NumTasks()) return false;
+  for (size_t i = 0; i < ra.NumTasks(); ++i) {
+    if (static_cast<size_t>(ra.Range(i).begin()) !=
+            static_cast<size_t>(rb.Range(i).begin()) ||
+        static_cast<size_t>(ra.Range(i).end()) !=
+            static_cast<size_t>(rb.Range(i).end())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Keep the original fixed configuration's rounding boundaries. Changes to
+// other tiling parameters only reorder independent output elements.
+static inline std::vector<MMConfig> MMI8ExactCandidates(
+    const std::vector<MMConfig>& candidates, size_t K) {
+  HWY_ASSERT(!candidates.empty());
+  std::vector<MMConfig> legal;
+  legal.reserve(candidates.size());
+  for (const auto& candidate : candidates) {
+    if (MMI8SameKPartition(candidates.front(), candidate, K)) {
+      legal.push_back(candidate);
+    }
+  }
+
+  // A bounded search finishes after at most 32 ordinary invocations. Keep
+  // the reference first, then spread trials over loop orders, register tiles,
+  // task granularity and cache tiles rather than adjacent similar configs.
+  const auto tile_distance = [](size_t a, size_t b) {
+    size_t hi = HWY_MAX(a, b);
+    const size_t lo = HWY_MIN(a, b);
+    size_t distance = 0;
+    while (hi > lo) {
+      hi = hwy::DivCeil(hi, size_t{2});
+      ++distance;
+    }
+    return distance;
+  };
+  const auto distance = [&](const MMConfig& a, const MMConfig& b) {
+    return size_t{32} * (a.Order() != b.Order()) +
+           size_t{16} * (a.MR() != b.MR()) +
+           size_t{8} * (a.InnerTasks() != b.InnerTasks()) +
+           tile_distance(a.MC(), b.MC()) + tile_distance(a.NC(), b.NC());
+  };
+  std::vector<MMConfig> selected;
+  selected.reserve(8);
+  selected.push_back(legal.front());
+  while (selected.size() < 8) {
+    size_t best_index = 0;
+    size_t best_distance = 0;
+    for (size_t i = 1; i < legal.size(); ++i) {
+      size_t nearest = ~size_t{0};
+      for (const auto& previous : selected) {
+        nearest = HWY_MIN(nearest, distance(legal[i], previous));
+      }
+      if (nearest > best_distance) {
+        best_distance = nearest;
+        best_index = i;
+      }
+    }
+    if (best_distance == 0) break;
+    selected.push_back(legal[best_index]);
+  }
+  return selected;
+}
+
 static inline std::vector<MMConfig> MMI8Candidates(
     MatMulEnv& env, size_t M, size_t K, size_t N, size_t num_B,
     size_t sizeof_TC, bool prefer_full_k = false) {
   auto candidates = MMCandidates(env.ctx.cache_info, M, K, N, num_B,
                                   sizeof_TC, env.print_config);
-  if (!env.autotune &&
+  if ((!env.autotune || MMI8ExactAutotune()) &&
       (prefer_full_k || MMI8Flag("GEMMA_MM_I8_MIN_K_SPLITS"))) {
     // Generic candidates enumerate split-K loop orders first. Prefer fewer
     // intermediate output rounds in fixed W8A8 evaluation while retaining the
@@ -1617,8 +1864,35 @@ static inline std::vector<MMConfig> MMI8Candidates(
         });
     if (best != candidates.end()) std::iter_swap(candidates.begin(), best);
   }
+  if (MMI8ExactAutotune()) return MMI8ExactCandidates(candidates, K);
   return candidates;
 }
+
+// The ordinary notifier follows env.autotune, which can remain disabled for
+// reproducible BF16 matmuls while the constrained I8 tuner is enabled.
+static inline void MMI8NotifyAutotuneResult(MatMulEnv& env, size_t M, size_t K,
+                                            size_t N, size_t num_B, uint64_t t0,
+                                            MMAutoTune<MMConfig>& tuner,
+                                            const MMConfig& cfg) {
+  if (env.autotune || !MMI8ExactAutotune()) {
+    MMImpl::NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
+    return;
+  }
+  const uint64_t t1 =
+      env.have_timer_stop ? hwy::timer::Stop() : hwy::timer::Start();
+  tuner.NotifyTicks(t1 - t0);
+  if (HWY_UNLIKELY(env.print_best && tuner.Best())) {
+    const auto& best = *tuner.Best();
+    fprintf(stderr,
+            "I8 exact autotune %zu,%zu,%zu,B%zu: MR%zu MC%zu KC%zu NC%zu "
+            "%s tasks%zu\n",
+            M, K, N, num_B, best.MR(), best.MC(), best.KC(), best.NC(),
+            StringFromOrder(best.Order()), best.InnerTasks());
+  }
+}
+
+#include "ops/matmul_i8_compact_prefix-inl.h"
+#include "ops/matmul_i8_gate_prefill-inl.h"
 
 // As `MatMul`, but `A` is quantized on the fly and `B` was packed by `PackB`.
 // Reuses the same blocking, parallelization and autotuning as `MatMul`; only
@@ -1644,17 +1918,22 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
       M, K, N, num_B, cache.VectorBytes(), env.per_cluster[cluster_idx],
       B.block_size ? MMActivation::kI8Block : MMActivation::kI8);
 
+  // Prefix sparsity is safe only for this settled config. Unknown or active
+  // tuning states retain the original arbitrary-range prefix contract.
+  MMAutoTune<MMConfig>& tuner = per_key.autotune;
+  if (MMI8TryCompactPrefixMatMul(A, B, add, env, C, C_rows, a_storage,
+                                  options, tuner)) return &per_key;
+  const size_t prefix_mode = MMI8PrefixModeFor(B, nullptr, tuner.Best(), K);
   // Outside the timed section, as `MMDecompress::MaybeDecompressA`.
   MMI8AView residual;
   const MMI8AView A_view =
       QuantizeA(A, a_storage, env.ctx, cluster_idx, B.a_pre_scale, B.block_size,
-                MMI8UseDualA(B, M) ? &residual : nullptr);
+                MMI8UseDualA(B, M) ? &residual : nullptr, prefix_mode);
 
   const MMI8B* B2 = nullptr;  // required for type matching
 
   // Scales are per row/column, hence folded into `A_view.scale` and
   // `B.scale`; the scalar `MMArgs::scale_A` is unused.
-  MMAutoTune<MMConfig>& tuner = per_key.autotune;
   if (HWY_LIKELY(tuner.Best())) {
     const MMArgs args(env, M, K, N, /*scale_A=*/1.0f, add, options, tuner,
                       *tuner.Best());
@@ -1669,7 +1948,7 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
     tuner.SetCandidates(
         MMI8Candidates(env, M, K, N, num_B, sizeof(TC),
                        MMI8PreferFullHeadK(B, M, hwy::IsSame<TC, float>())),
-        env.autotune);
+        env.autotune || MMI8ExactAutotune());
   }
 
   const MMConfig& cfg = tuner.NextConfig();
@@ -1677,7 +1956,7 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
 
   const uint64_t t0 = hwy::timer::Start();
   MMLoops::Dispatch<MMI8Kernel>(A_view, B, B2, C_rows, args);
-  MMImpl::NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
+  MMI8NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
 
   return &per_key;
 }
@@ -1708,13 +1987,16 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
 
   HWY_DASSERT(B1.a_pre_scale == nullptr && B2.a_pre_scale == nullptr);
   HWY_ASSERT(B1.block_size == B2.block_size);
+  MMAutoTune<MMConfig>& tuner = per_key.autotune;
+  if (MMI8TryGatePrefill(A, B1, B2, env, C, C_rows, a_storage,
+                          options, tuner)) return &per_key;
+  const size_t prefix_mode = MMI8PrefixModeFor(B1, &B2, tuner.Best(), K);
   MMI8AView residual;
   const bool dual = MMI8UseDualA(B1, M) || MMI8UseDualA(B2, M);
   const MMI8AView A_view =
       QuantizeA(A, a_storage, env.ctx, cluster_idx, nullptr, B1.block_size,
-                dual ? &residual : nullptr);
+                dual ? &residual : nullptr, prefix_mode);
 
-  MMAutoTune<MMConfig>& tuner = per_key.autotune;
   if (HWY_LIKELY(tuner.Best())) {
     const MMArgs args(env, M, K, N, /*scale_A=*/1.0f, /*add=*/nullptr, options,
                       tuner, *tuner.Best());
@@ -1728,9 +2010,8 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
     HWY_ASSERT(M <= kMaxBatchSize);
     HWY_ASSERT(N % kNR == 0);
     const size_t max_M = MMKeys::BucketM(M);
-    tuner.SetCandidates(
-        MMI8Candidates(env, max_M, K, N, num_B, sizeof(BF16)),
-        env.autotune);
+    tuner.SetCandidates(MMI8Candidates(env, max_M, K, N, num_B, sizeof(BF16)),
+                        env.autotune || MMI8ExactAutotune());
   }
 
   const MMConfig& cfg = tuner.NextConfig();
@@ -1738,7 +2019,7 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
                     tuner, cfg);
   const uint64_t t0 = hwy::timer::Start();
   MMLoops::Dispatch<MMI8Kernel>(A_view, B1, &B2, C_rows, args);
-  MMImpl::NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
+  MMI8NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
 
   return &per_key;
 }

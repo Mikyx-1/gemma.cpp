@@ -69,6 +69,10 @@ inline void MaybeReshapeCache(const size_t default_cols, MatPtrT<KV_t>& cache) {
                       AttentionActivationsPtrs& activations, QBatch& qbatch,   \
                       MatMulEnv& env, AttentionImpl attention_impl,            \
                       int flags);                                              \
+  void GemmaPrefillKVOnly(size_t num_tokens, size_t layer_idx,                 \
+                          const LayerWeightsPtrs& layer,                       \
+                          AttentionActivationsPtrs& activations,               \
+                          QBatch& qbatch, MatMulEnv& env);                     \
   /* Flat M1 helpers for exact verification after batched Q/KV projection. */  \
   /* Return false, without writes, for unsupported tiled attention/batches. */ \
   bool GemmaPrepareKVFromProjectedM1(size_t layer_idx,                         \

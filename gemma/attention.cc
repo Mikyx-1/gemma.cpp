@@ -171,7 +171,6 @@ void PositionalEncodingQK(float* qk, const size_t layer_idx,
 // `Attention`, use separate `num_tokens` and `num_queries`. `num_tokens` is the
 // number of tokens from one query: 1 for decode, otherwise prefill_tbatch_size.
 
-// Fills activations.q and writes to KV cache.
 // Applies exactly the native cache processing after Q/KV projection. The
 // projected BF16 KV rows are already in their final flat cache locations.
 static HWY_INLINE void PrepareGemmaProjectedKVCache(
@@ -282,6 +281,8 @@ static HWY_INLINE void PrepareGemmaProjectedKVCache(
       });
 }
 
+// Fills activations.q and writes to KV cache.
+template <bool kSkipQ = false>
 static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
                                   const LayerWeightsPtrs& layer,
                                   AttentionActivationsPtrs& activations,
@@ -311,8 +312,10 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
 
   // The original qkv_einsum_w has shape [(heads + kv_heads * 2), qkv_dim,
   // model_dim], which we reshaped to (heads + kv_heads * 2) * qkv_dim rows.
-  CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
-             /*add=*/nullptr, env, activations.q);
+  if constexpr (!kSkipQ) {
+    CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
+               /*add=*/nullptr, env, activations.q);
+  }
 
   if (skip_kv) return;
   // Set up MatMul row pointers for writing to KV, which consists of
@@ -349,8 +352,16 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
 // final-layer position, flat cache, token count, no sharing, and fixed tuning.
 // Existing ComputeQKV<false> call sites retain their original behavior.
 
-// Copies only committed input rows. Flat KV already contains native key norm,
-// RoPE and BF16 rounding; transposing it must not repeat those operations.
+void GemmaPrefillKVOnly(size_t num_tokens, size_t layer_idx,
+                        const LayerWeightsPtrs& layer,
+                        AttentionActivationsPtrs& activations,
+                        QBatch& qbatch, MatMulEnv& env) {
+  HWY_DASSERT(qbatch.Size() == 1 && num_tokens != 0);
+  HWY_DASSERT(layer.layer_config.kv_share_layer_idx < 0);
+  HWY_DASSERT(!layer.layer_config.IsMHA());
+  ComputeQKV<true>(num_tokens, layer_idx, layer, activations, qbatch,
+                    /*flags=*/0, env);
+}
 
 // Commits one raw projected row, then executes the same M1 cache normalization,
 // RoPE, BF16 compression, transposition, and future padding as native decode.
