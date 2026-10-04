@@ -280,6 +280,29 @@ FetchContent_GetProperties(sentencepiece)
 ## Library Target
 
 add_library(libgemma ${SOURCES})
+
+# Proposal indexes are optional; ordinary inference has no HNSW/OpenSSL dependency.
+option(GEMMA_HEAD_SPEC_HNSW "Enable CPU speculative decoding with INT8 HNSW proposals" OFF)
+set(GEMMA_HNSWLIB_DIR "" CACHE PATH "Optional local source tree for pinned hnswlib v0.9.0")
+if(GEMMA_HEAD_SPEC_HNSW)
+  if(GEMMA_HNSWLIB_DIR)
+    if(NOT EXISTS "${GEMMA_HNSWLIB_DIR}/hnswlib/hnswlib.h")
+      message(FATAL_ERROR "GEMMA_HNSWLIB_DIR must contain hnswlib/hnswlib.h")
+    endif()
+    set(gemma_hnsw_source "${GEMMA_HNSWLIB_DIR}")
+  else()
+    FetchContent_Declare(gemma_hnsw
+      GIT_REPOSITORY https://github.com/nmslib/hnswlib.git
+      GIT_TAG d9b3608c83d83b46c96e25088cb1d729b29dcfe9)
+    set(HNSWLIB_EXAMPLES OFF CACHE BOOL "Build hnswlib examples" FORCE)
+    FetchContent_MakeAvailable(gemma_hnsw)
+    set(gemma_hnsw_source "${gemma_hnsw_SOURCE_DIR}")
+  endif()
+  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+  set_property(SOURCE gemma/gemma.cc APPEND PROPERTY COMPILE_DEFINITIONS GEMMA_HEAD_SPEC_HNSW=1)
+  set_property(SOURCE gemma/gemma.cc APPEND PROPERTY INCLUDE_DIRECTORIES "${gemma_hnsw_source}")
+  target_link_libraries(libgemma OpenSSL::Crypto)
+endif()
 set_property(TARGET libgemma PROPERTY CXX_STANDARD ${GEMMA_CXX_STANDARD})
 set_target_properties(libgemma PROPERTIES PREFIX "")
 set_property(TARGET libgemma PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -314,6 +337,10 @@ target_link_libraries(gemma_shared PRIVATE
     $<LINK_LIBRARY:WHOLE_ARCHIVE,hwy_contrib>
     $<LINK_LIBRARY:WHOLE_ARCHIVE,sentencepiece-static>
 )
+if(GEMMA_HEAD_SPEC_HNSW)
+  target_include_directories(gemma_shared PRIVATE "${gemma_hnsw_source}")
+  target_link_libraries(gemma_shared PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+endif()
 target_include_directories(gemma_shared PUBLIC ${sentencepiece_SOURCE_DIR})
 target_compile_definitions(gemma_shared
     PRIVATE
@@ -347,6 +374,9 @@ target_link_libraries(convert_dsv4 libgemma hwy hwy_contrib nlohmann_json::nlohm
 # DeepSeek V4 generation driver (chat template + HF BPE tokenization in C++).
 add_executable(run_dsv4 deepseek/run_dsv4.cc)
 target_link_libraries(run_dsv4 libgemma hwy hwy_contrib)
+
+add_executable(spec_decode_bench evals/spec_decode_bench.cc)
+target_link_libraries(spec_decode_bench libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)
 
 add_executable(single_benchmark evals/benchmark.cc)
 target_link_libraries(single_benchmark libgemma hwy hwy_contrib nlohmann_json::nlohmann_json)

@@ -25,9 +25,9 @@
 #include "gemma/kv_cache.h"  // KV_t
 #include "gemma/query.h"     // QBatch
 #include "gemma/weights.h"   // LayerWeightsPtrs
-#include "ops/matmul.h"
 #include "hwy/highway.h"     // HWY_VISIT_TARGETS
 #include "hwy/per_target.h"  // VectorBytes
+#include "ops/matmul.h"
 
 namespace gcpp {
 
@@ -52,29 +52,47 @@ inline void MaybeReshapeCache(const size_t default_cols, MatPtrT<KV_t>& cache) {
 }
 
 // Passed to HWY_VISIT_TARGETS; declares for one target.
-#define GEMMA_DECL_ATTENTION(TARGET, NAMESPACE)                               \
-  namespace NAMESPACE {                                                       \
-  void TransposeKVCacheRow(const KV_t* HWY_RESTRICT kv, KV_t* HWY_RESTRICT k, \
-                           KV_t* HWY_RESTRICT v, size_t qkv_dim);             \
-  void TransposeOOBKVCacheRow(KV_t* HWY_RESTRICT k, KV_t* HWY_RESTRICT v,     \
-                              size_t qkv_dim);                                \
-                                                                              \
-  void PositionalEncodingQK(float* qk, size_t layer_idx,                      \
-                            const AttentionActivationsPtrs& activations,      \
-                            ThreadingContext& ctx, size_t worker, size_t pos, \
-                            float mul);                                       \
-                                                                              \
-  void GemmaAttention(size_t num_tokens, const size_t layer_idx,              \
-                      const LayerWeightsPtrs& layer,                          \
-                      AttentionActivationsPtrs& activations, QBatch& qbatch,  \
-                      MatMulEnv& env, AttentionImpl attention_impl,           \
-                      int flags);                                             \
-  /* Final-layer token-prefill projection; caller guards flat KV. */         \
+#define GEMMA_DECL_ATTENTION(TARGET, NAMESPACE)                                \
+  namespace NAMESPACE {                                                        \
+  void TransposeKVCacheRow(const KV_t* HWY_RESTRICT kv, KV_t* HWY_RESTRICT k,  \
+                           KV_t* HWY_RESTRICT v, size_t qkv_dim);              \
+  void TransposeOOBKVCacheRow(KV_t* HWY_RESTRICT k, KV_t* HWY_RESTRICT v,      \
+                              size_t qkv_dim);                                 \
+                                                                               \
+  void PositionalEncodingQK(float* qk, size_t layer_idx,                       \
+                            const AttentionActivationsPtrs& activations,       \
+                            ThreadingContext& ctx, size_t worker, size_t pos,  \
+                            float mul);                                        \
+                                                                               \
+  void GemmaAttention(size_t num_tokens, const size_t layer_idx,               \
+                      const LayerWeightsPtrs& layer,                           \
+                      AttentionActivationsPtrs& activations, QBatch& qbatch,   \
+                      MatMulEnv& env, AttentionImpl attention_impl,            \
+                      int flags);                                              \
   void GemmaPrefillKVOnly(size_t num_tokens, size_t layer_idx,                 \
-                          const LayerWeightsPtrs& layer,                     \
-                          AttentionActivationsPtrs& activations,             \
-                          QBatch& qbatch, MatMulEnv& env);                    \
-  /* NOLINTNEXTLINE(google-readability-namespace-comments) */                 \
+                          const LayerWeightsPtrs& layer,                       \
+                          AttentionActivationsPtrs& activations,               \
+                          QBatch& qbatch, MatMulEnv& env);                     \
+  /* Flat M1 helpers for exact verification after batched Q/KV projection. */  \
+  /* Return false, without writes, for unsupported tiled attention/batches. */ \
+  bool GemmaPrepareKVFromProjectedM1(size_t layer_idx,                         \
+                                     const LayerWeightsPtrs& layer,            \
+                                     const MatPtrT<BF16>& projected_kv,        \
+                                     AttentionActivationsPtrs& activations,    \
+                                     QBatch& qbatch, MatMulEnv& env,           \
+                                     AttentionImpl attention_impl);            \
+  bool GemmaAttentionFromProjectedM1(size_t layer_idx,                         \
+                                     const LayerWeightsPtrs& layer,            \
+                                     AttentionActivationsPtrs& activations,    \
+                                     QBatch& qbatch, MatMulEnv& env,           \
+                                     AttentionImpl attention_impl);            \
+  /* Guarded batched native-M1 attention; false makes no writes. */            \
+  bool GemmaAttentionFromProjectedBatchM1(                                     \
+      size_t num_tokens, size_t layer_idx, const LayerWeightsPtrs& layer,      \
+      const MatPtrT<BF16>& projected_kv,                                       \
+      AttentionActivationsPtrs& activations, QBatch& qbatch, MatMulEnv& env,   \
+      AttentionImpl attention_impl);                                           \
+  /* NOLINTNEXTLINE(google-readability-namespace-comments) */                  \
   }  // namespace NAMESPACE
 
 // Function declarations for each SIMD target. Allows direct call from the

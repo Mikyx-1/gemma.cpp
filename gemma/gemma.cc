@@ -17,6 +17,13 @@
 // implementations in gemma-inl.h.
 
 #include "gemma/gemma.h"
+#ifndef GEMMA_HEAD_SPEC_HNSW
+#define GEMMA_HEAD_SPEC_HNSW 0
+#endif
+#if GEMMA_HEAD_SPEC_HNSW
+#include "gemma/speculative/body_spec_registry.h"
+#include "gemma/speculative/head_spec_ann_registry.h"
+#endif
 
 #include <cmath>
 #include <cstddef>
@@ -1704,6 +1711,13 @@ void SetWeightStats(const LayerWeightsPtrs& layer, Activations& a,
 }
 
 // Decode: generates one continuation token for each query in `qbatch`.
+#if GEMMA_HEAD_SPEC_HNSW
+#include "gemma/speculative/exact_i8_project-inl.h"
+#include "gemma/speculative/exact_dense_body-inl.h"
+#include "gemma/speculative/head_spec-inl.h"
+#include "gemma/speculative/body_spec-inl.h"
+#endif
+
 static void GenerateT(const ModelConfig& config,
                       const RuntimeConfig& runtime_config,
                       const AesCtrEngine& engine, const WeightsPtrs& weights,
@@ -1748,7 +1762,24 @@ static void GenerateT(const ModelConfig& config,
 
   MaybePrint(2, timing_info.verbosity, "\n[ BEGIN PHASE: generate ]\n");
 
+#if GEMMA_HEAD_SPEC_HNSW
+  if (max_gen_steps >= 2 && non_eos.Any())
+    HeadSpecAnnPrepareForGeneration(config, runtime_config, weights, qbatch,
+                                    env);
+#endif
   timing_info.generate_start = hwy::platform::Now();
+#if GEMMA_HEAD_SPEC_HNSW
+  if (TryGenerateBodySpec(config, runtime_config, weights, activations, qbatch,
+                          env, timing_info, non_eos, max_gen_steps, sample_token)) {
+    timing_info.NotifyGenerateDone();
+    return;
+  }
+  if (TryGenerateHeadSpec(config, runtime_config, weights, activations, qbatch,
+                          env, timing_info, non_eos, max_gen_steps, sample_token)) {
+    timing_info.NotifyGenerateDone();
+    return;
+  }
+#endif
   for (size_t gen = 0; gen < max_gen_steps && non_eos.Any(); ++gen) {
     Transformer(config, runtime_config, weights, activations, qbatch, env);
     SampleAndStream(config, runtime_config, weights, sample_token, activations,
@@ -1954,11 +1985,34 @@ Gemma::Gemma(const GemmaArgs& args, ThreadingContext& ctx)
   weight_read_mode_ = weights_.ReadFromBlobs(model_, reader_, args.loader,
                                              args.inference, mat_owners_, ctx);
 
+#if GEMMA_HEAD_SPEC_HNSW
+  const MatPtr& head = weights_.lm_head.HasPtr()
+                           ? weights_.lm_head
+                           : weights_.embedder_input_embedding;
+#endif
   // Read everything into memory, or `weights_.mapped_` keeps the mapping alive.
   reader_.CloseFile();
+
+#if GEMMA_HEAD_SPEC_HNSW
+  if (head.HasPtr()) {
+    const void* key = head.RowBytes(0);
+    RegisterBodySpecDraft(key, *this, args, ctx);
+  }
+#endif
 }
 
-Gemma::~Gemma() = default;
+Gemma::~Gemma() {
+#if GEMMA_HEAD_SPEC_HNSW
+  const MatPtr& head = weights_.lm_head.HasPtr()
+                           ? weights_.lm_head
+                           : weights_.embedder_input_embedding;
+  if (head.HasPtr()) {
+    const void* key = head.RowBytes(0);
+    UnregisterBodySpecDraft(key);
+    UnregisterHeadSpecAnn(key);
+  }
+#endif
+}
 
 void Gemma::Save(const Path& weights_path, ThreadingContext& ctx) const {
   BlobWriter writer(weights_path, ctx);
