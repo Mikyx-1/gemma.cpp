@@ -88,6 +88,33 @@ namespace HWY_NAMESPACE {
 using gcpp::BF16;
 using gcpp::MatPtr;
 
+#include "gemma/prefill_row_norm-inl.h"
+
+// The caller is PrefillTBatch, which establishes the phase explicitly. The
+// public TransformerLayer entry remains unchanged for decode and verification.
+static bool PrivatePrefillRowNormAllowed(
+    size_t num_tokens, const ModelConfig& config, const RuntimeConfig& runtime,
+    const Activations& activations, const QBatch& qbatch, const MatMulEnv& env) {
+  static const bool enabled = MMI8Flag("GEMMA_MM_I8_PREFILL_ROW_NORM");
+  if (!enabled || num_tokens <= 1 || num_tokens != activations.x.Rows() ||
+      (config.model != Model::GEMMA3_270M && config.model != Model::GEMMA3_1B) ||
+      config.is_encoder_decoder || config.ple_dim != 0 || qbatch.Size() != 1 ||
+      qbatch.PrefixEnd(0) != 0 ||
+      activations.attention_impl != AttentionImpl::kFlash ||
+      runtime.attention_impl != AttentionImpl::kFlash ||
+      runtime.image_tokens != nullptr || runtime.use_mtp ||
+      runtime.layers_output || runtime.activations_observer || kObserver ||
+      GCPP_TENSOR_STATS || COMPRESS_STATS || env.autotune ||
+      MMI8CalibrationCaptureEnabled()) return false;
+  for (const char* key : {"GEMMA_MM_I8_CALIBRATION_DIR",
+                          "GEMMA_MM_I8_SCALE_CALIBRATION_DIR"}) {
+    const char* value = getenv(key);
+    if (value != nullptr && *value != '\0') return false;
+  }
+  const auto& cache = MMI8WeightCache::Get();
+  return cache.Enabled() && !cache.ScalingEnabled();
+}
+
 void Attention(LayerAttentionType type, const size_t num_tokens,
                const size_t layer_idx, const LayerWeightsPtrs& layer,
                Activations& activations, QBatch& qbatch, MatMulEnv& env) {
@@ -109,12 +136,16 @@ void Attention(LayerAttentionType type, const size_t num_tokens,
   }
 }
 
-HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
-                                   const size_t layer_idx,
-                                   const LayerWeightsPtrs& layer,
-                                   Activations& activations, QBatch& qbatch,
-                                   MatMulEnv& env) {
+static HWY_NOINLINE void PrivateTransformerLayer(
+    const size_t num_tokens, const size_t layer_idx,
+    const LayerWeightsPtrs& layer, Activations& activations, QBatch& qbatch,
+    MatMulEnv& env, bool fuse_prefill_rows) {
   const LayerConfig& layer_config = layer.layer_config;
+  fuse_prefill_rows = fuse_prefill_rows &&
+      layer_config.type == LayerAttentionType::kGemma &&
+      layer_config.post_norm == PostNormType::Scale &&
+      !layer_config.IsMoE() && layer_config.ple_dim == 0 &&
+      !layer.skip_scale.HasPtr();
   if (layer_config.type == LayerAttentionType::kDeepSeekMLA) {
     DeepSeekTransformerLayer(num_tokens, layer_idx, layer, activations, qbatch,
                              env);
@@ -149,17 +180,24 @@ HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
   Attention(layer_config.type, num_tokens, layer_idx, layer, activations,
             qbatch, env);
 
-  PostNorm(layer_config.post_norm, layer.post_attention_norm_scale,
-           activations.attention.att_sums, env.ctx);
-  ResidualConnection(activations.attention.att_sums, activations.x, layer,
-                     /*is_attention=*/true, env.ctx);
+  const bool fused_attention_rows = fuse_prefill_rows &&
+      PrivatePrefillNormResidualPreNorm(
+          layer.post_attention_norm_scale, activations.attention.att_sums,
+          activations.x, layer.pre_ffw_norm_scale, activations.pre_ffw_rms_out,
+          env.ctx);
+  if (!fused_attention_rows) {
+    PostNorm(layer_config.post_norm, layer.post_attention_norm_scale,
+             activations.attention.att_sums, env.ctx);
+    ResidualConnection(activations.attention.att_sums, activations.x, layer,
+                       /*is_attention=*/true, env.ctx);
 
-  const MatPtr& ff_norm =
-      scale_i8 ? i8_cache.NormWeights(
-                     layer.pre_ffw_norm_scale,
-                     {&layer.gating_einsum_w1, &layer.gating_einsum_w2}, env)
-               : layer.pre_ffw_norm_scale;
-  RMSNormBatched(activations.x, ff_norm, activations.pre_ffw_rms_out, env.ctx);
+    const MatPtr& ff_norm =
+        scale_i8 ? i8_cache.NormWeights(
+                       layer.pre_ffw_norm_scale,
+                       {&layer.gating_einsum_w1, &layer.gating_einsum_w2}, env)
+                 : layer.pre_ffw_norm_scale;
+    RMSNormBatched(activations.x, ff_norm, activations.pre_ffw_rms_out, env.ctx);
+  }
 
   if (layer_config.type == LayerAttentionType::kVit) {
     FFWVit(layer, activations, env);
@@ -167,11 +205,16 @@ HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
     FFWNoVit(layer, activations, env);
   }
 
-  PostNorm(layer_config.post_norm, layer.post_ffw_norm_scale,
-           activations.ffw_out, env.ctx);
+  const bool fused_ffn_rows = fused_attention_rows &&
+      PrivatePrefillNormResidual(layer.post_ffw_norm_scale, activations.ffw_out,
+                                 activations.x, env.ctx);
+  if (!fused_ffn_rows) {
+    PostNorm(layer_config.post_norm, layer.post_ffw_norm_scale,
+             activations.ffw_out, env.ctx);
 
-  ResidualConnection(activations.ffw_out, activations.x, layer,
-                     /*is_attention=*/false, env.ctx);
+    ResidualConnection(activations.ffw_out, activations.x, layer,
+                       /*is_attention=*/false, env.ctx);
+  }
   if (layer_config.ple_dim > 0) {
     // 1. Gate: [batch, model_dim] @ [model_dim, ple_dim] -> [batch, ple_dim]
     // Use activations.x_bf to convert activations.x
@@ -238,6 +281,16 @@ HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
       MulByConst(skip_scale_val, activations.x.Row(r), activations.x.Cols());
     }
   }
+}
+
+// Keep the public/internal declaration and all existing callers unchanged.
+HWY_NOINLINE void TransformerLayer(const size_t num_tokens,
+                                   const size_t layer_idx,
+                                   const LayerWeightsPtrs& layer,
+                                   Activations& activations, QBatch& qbatch,
+                                   MatMulEnv& env) {
+  PrivateTransformerLayer(num_tokens, layer_idx, layer, activations, qbatch,
+                          env, /*fuse_prefill_rows=*/false);
 }
 
 // Returns the scale value to use for the embedding (basically sqrt model_dim).
@@ -1251,10 +1304,13 @@ static HWY_NOINLINE void PrefillTBatch(const ModelConfig& config,
 
       // Transformer with one batch of tokens from a single query. No need to
       // set `PrevToken` because we already did the embedding above.
+      const bool fuse_prefill_rows = PrivatePrefillRowNormAllowed(
+          tbatch_size, config, runtime_config, activations, qbatch_1, env);
       for (size_t layer_idx = 0; layer_idx < config.layer_configs.size();
            ++layer_idx) {
-        TransformerLayer(tbatch_size, layer_idx, *weights.GetLayer(layer_idx),
-                         activations, qbatch_1, env);
+        PrivateTransformerLayer(tbatch_size, layer_idx,
+                                *weights.GetLayer(layer_idx), activations,
+                                qbatch_1, env, fuse_prefill_rows);
       }
 
       // Speculative decoding (DeepSeek V4): keep the MTP block's KV cache in
