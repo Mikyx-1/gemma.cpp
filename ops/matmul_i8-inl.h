@@ -1368,16 +1368,121 @@ static HWY_INLINE VF LoadNF32(DF df, const TA* HWY_RESTRICT p, size_t n) {
   }
 }
 
+// Optional exact scan of the already quantized signed bytes. No float
+// quantization or residual operation changes. Other targets use the scalar
+// loop. GEMMA_MM_I8_PREFIX_SCAN=8 or 16; absent/invalid/0 retains the scalar
+// default.
+static inline size_t MMI8PrefixScanMode() {
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86 && GEMMA_MM_I8_BIASED_B
+  static const size_t mode = []() -> size_t {
+    const char* value = getenv("GEMMA_MM_I8_PREFIX_SCAN");
+    if (value != nullptr && value[0] == '8' && value[1] == '\0') return 8;
+    if (value != nullptr && value[0] == '1' && value[1] == '6' &&
+        value[2] == '\0')
+      return 16;
+    return 0;
+  }();
+  return mode;
+#else
+  return 0;
+#endif
+}
+
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+static HWY_INLINE void MMI8PrefixScan8(const int8_t* input, size_t count,
+                                       int32_t base, int32_t* prefix) {
+  prefix[0] = base;
+  const __m256i last = _mm256_set1_epi32(7);
+  __m256i carry = _mm256_set1_epi32(base);
+  size_t i = 0;
+  for (; i + 8 <= count; i += 8) {
+    __m256i scan = _mm256_cvtepi8_epi32(
+        _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input + i)));
+    // Two independent inclusive scans of four i32 elements each.
+    scan = _mm256_add_epi32(scan, _mm256_slli_si256(scan, 4));
+    scan = _mm256_add_epi32(scan, _mm256_slli_si256(scan, 8));
+    // Put the low-half total into all high-half lanes, zero in low lanes.
+    __m256i half = _mm256_permute2x128_si256(scan, scan, 0x08);
+    half = _mm256_shuffle_epi32(half, 0xff);
+    scan = _mm256_add_epi32(scan, half);
+    scan = _mm256_add_epi32(scan, carry);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(prefix + i + 1), scan);
+    carry = _mm256_permutevar8x32_epi32(scan, last);
+  }
+  if (i != count) {
+    int32_t sum = _mm256_extract_epi32(carry, 0);
+    for (; i < count; ++i) {
+      sum += input[i];
+      prefix[i + 1] = sum;
+    }
+  }
+}
+
+static HWY_INLINE void MMI8PrefixScan16(const int8_t* input, size_t count,
+                                        int32_t base, int32_t* prefix) {
+  prefix[0] = base;
+  const __m256i last = _mm256_set1_epi32(7);
+  __m256i carry = _mm256_set1_epi32(base);
+  size_t i = 0;
+  for (; i + 16 <= count; i += 16) {
+    __m256i scan = _mm256_cvtepi8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(input + i)));
+    // Each half has eight signed bytes: every partial sum is in
+    // [-1024,1016], safely representable in i16 even with input -128.
+    scan = _mm256_add_epi16(scan, _mm256_slli_si256(scan, 2));
+    scan = _mm256_add_epi16(scan, _mm256_slli_si256(scan, 4));
+    scan = _mm256_add_epi16(scan, _mm256_slli_si256(scan, 8));
+    __m256i low = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(scan));
+    __m256i high = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(scan, 1));
+    // Widen before adding the global carry, which may be near INT32 limits.
+    high = _mm256_add_epi32(high, _mm256_permutevar8x32_epi32(low, last));
+    low = _mm256_add_epi32(low, carry);
+    high = _mm256_add_epi32(high, carry);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(prefix + i + 1), low);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(prefix + i + 9), high);
+    carry = _mm256_permutevar8x32_epi32(high, last);
+  }
+  if (i != count) {
+    // Retains vector coverage for an 8..15 element tail and exact scalar
+    // behavior for smaller tails. The boundary prefix is rewritten equally.
+    MMI8PrefixScan8(input + i, count - i, _mm256_extract_epi32(carry, 0),
+                    prefix + i);
+  }
+}
+#endif
+
+static HWY_INLINE void MMI8BuildPrefix(const int8_t* input, size_t count,
+                                       int32_t base, int32_t* prefix,
+                                       size_t mode) {
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+  if (mode == 16) {
+    MMI8PrefixScan16(input, count, base, prefix);
+    return;
+  }
+  if (mode == 8) {
+    MMI8PrefixScan8(input, count, base, prefix);
+    return;
+  }
+#else
+  (void)mode;
+#endif
+  int32_t sum = base;
+  prefix[0] = base;
+  for (size_t j = 0; j < count; ++j) {
+    sum += input[j];
+    prefix[j + 1] = sum;
+  }
+}
+
 // Quantizes one row of `k` activations to symmetric int8, returning the
 // dequantization scale. Also writes `k + 1` prefix sums of the quantized
 // values (when `B` is biased), which the kernel uses to undo that bias for
 // whichever `kc` range it is working on. `out` is zero-padded to `padded_k`.
 template <typename TA>
-static HWY_INLINE float QuantizeRowA(const TA* HWY_RESTRICT in, size_t k,
-                                     MMI8AT* HWY_RESTRICT out,
-                                     int32_t* HWY_RESTRICT prefix,
-                                     size_t padded_k,
-                                     int32_t prefix_base = 0) {
+static HWY_INLINE float QuantizeRowA(
+    const TA* HWY_RESTRICT in, size_t k, MMI8AT* HWY_RESTRICT out,
+    int32_t* HWY_RESTRICT prefix, size_t padded_k, int32_t prefix_base = 0,
+    size_t prefix_scan_mode = MMI8PrefixScanMode()) {
   const hn::ScalableTag<float> df;
   const hn::Rebind<int32_t, decltype(df)> di32;
   const hn::Rebind<MMI8AT, decltype(df)> d8;
@@ -1416,14 +1521,7 @@ static HWY_INLINE float QuantizeRowA(const TA* HWY_RESTRICT in, size_t k,
   }
 
   if constexpr (GEMMA_MM_I8_BIASED_B) {
-    // Scalar, but only `M * K` additions per MatMul, i.e. the same order as
-    // the quantization itself and negligible next to `M * K * N` products.
-    int32_t sum = prefix_base;
-    prefix[0] = prefix_base;
-    for (size_t j = 0; j < k; ++j) {
-      sum += out[j];
-      prefix[j + 1] = sum;
-    }
+    MMI8BuildPrefix(out, k, prefix_base, prefix, prefix_scan_mode);
   }
   return scale;
 }
@@ -1534,7 +1632,8 @@ template <typename TA>
 static HWY_NOINLINE MMI8AView
 QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
           size_t cluster_idx, const float* a_pre_scale = nullptr,
-          size_t block_size = 0, MMI8AView* residual = nullptr) {
+          size_t block_size = 0, MMI8AView* residual = nullptr,
+          size_t prefix_scan_mode = MMI8PrefixScanMode()) {
   MMI8AView view = storage.View(A.Extents(), block_size);
   if (residual != nullptr) {
     *residual = storage.ResidualView(A.Extents(), block_size);
@@ -1571,7 +1670,7 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
           const int32_t base = GEMMA_MM_I8_BIASED_B && c ? prefix[c] : 0;
           const float raw_scale =
               QuantizeRowA(rotated.data() + c, group_size, view.data.Row(r) + c,
-                           prefix + c, group_size, base);
+                           prefix + c, group_size, base, prefix_scan_mode);
           scale[(c / group_size) * view.scale_stride + r] = a_scale * raw_scale;
           if (residual != nullptr) {
             const hn::CappedTag<float, 32> df;
@@ -1592,7 +1691,8 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
                                      r] =
                 a_scale * QuantizeRowA(rotated.data() + c, group_size,
                                        residual->data.Row(r) + c, rp + c,
-                                       group_size, residual_base);
+                                       group_size, residual_base,
+                                       prefix_scan_mode);
           }
         }
         for (size_t c = k; c < padded_k; ++c) {
@@ -1796,11 +1896,12 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
       M, K, N, num_B, cache.VectorBytes(), env.per_cluster[cluster_idx],
       B.block_size ? MMActivation::kI8Block : MMActivation::kI8);
 
+  const size_t prefix_mode = MMI8PrefixScanMode();
   // Outside the timed section, as `MMDecompress::MaybeDecompressA`.
   MMI8AView residual;
   const MMI8AView A_view =
       QuantizeA(A, a_storage, env.ctx, cluster_idx, B.a_pre_scale, B.block_size,
-                MMI8UseDualA(B, M) ? &residual : nullptr);
+                MMI8UseDualA(B, M) ? &residual : nullptr, prefix_mode);
 
   const MMI8B* B2 = nullptr;  // required for type matching
 
@@ -1860,11 +1961,12 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
 
   HWY_DASSERT(B1.a_pre_scale == nullptr && B2.a_pre_scale == nullptr);
   HWY_ASSERT(B1.block_size == B2.block_size);
+  const size_t prefix_mode = MMI8PrefixScanMode();
   MMI8AView residual;
   const bool dual = MMI8UseDualA(B1, M) || MMI8UseDualA(B2, M);
   const MMI8AView A_view =
       QuantizeA(A, a_storage, env.ctx, cluster_idx, nullptr, B1.block_size,
-                dual ? &residual : nullptr);
+                dual ? &residual : nullptr, prefix_mode);
 
   MMAutoTune<MMConfig>& tuner = per_key.autotune;
   if (HWY_LIKELY(tuner.Best())) {
