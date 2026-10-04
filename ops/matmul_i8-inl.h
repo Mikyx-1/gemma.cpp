@@ -493,6 +493,9 @@ class MMI8StoreHorizontalSumsIntoC {
         return hn::Add(hn::LowerHalf(d4, pairs), hn::UpperHalf(d4, pairs));
       };
       sum0 = reduce(C00, C01, C02, C03);
+      // Callers pass all four outputs by value even for one/two-row tiles.
+      // Match the generic reducer's zero values for unused output rows.
+      sum1 = sum2 = sum3 = hn::Zero(d4);
       if constexpr (kRowsAC > 1) sum1 = reduce(C10, C11, C12, C13);
       if constexpr (kRowsAC > 2) sum2 = reduce(C20, C21, C22, C23);
       if constexpr (kRowsAC > 3) sum3 = reduce(C30, C31, C32, C33);
@@ -831,8 +834,16 @@ class MMI8Kernel {
                                     CView C_MC_NR) {
     const hn::Full128<int32_t> d4i;
     hn::Vec<decltype(d4i)> sum0, sum1, sum2, sum3;
-    DotProducts<kRowsAC, kNative, false>(A_view, B_view, imc, kc, sum0, sum1,
-                                       sum2, sum3);
+    static const bool fast_reduce = MMI8Flag("GEMMA_MM_I8_FAST_REDUCE", true);
+    if (fast_reduce) {
+      // Integer additions can be regrouped without changing the final dot
+      // product. This avoids the generic stack transpose on AVX2.
+      DotProducts<kRowsAC, kNative, true>(A_view, B_view, imc, kc, sum0, sum1,
+                                          sum2, sum3);
+    } else {
+      DotProducts<kRowsAC, kNative, false>(A_view, B_view, imc, kc, sum0, sum1,
+                                           sum2, sum3);
+    }
 
     // Sums of the quantized `A` values over this `kc` range, for undoing `B`'s
     // bias. `A_view` is already restricted to the range, so `kc` is its width.
