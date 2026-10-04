@@ -617,6 +617,12 @@ class MMI8StoreHorizontalSumsIntoC {
   }
 };  // MMI8StoreHorizontalSumsIntoC
 
+#include "ops/matmul_i8_micro_prefill-inl.h"
+#include "ops/matmul_i8_micro_prefill16-inl.h"
+#include "ops/matmul_i8_micro_tile-inl.h"
+#include "ops/matmul_i8_micro_prefill32-inl.h"
+#include "ops/matmul_i8_micro_prefill48-inl.h"
+
 //------------------------------------------------------------------------------
 // Kernel
 
@@ -1030,6 +1036,20 @@ class MMI8Kernel {
                                              const IndexRange& range_nc,
                                              const MMArgs& args, Tag tag,
                                              CView C) {
+#if HWY_ARCH_X86_64
+    static const bool multi_row = MMI8Flag("GEMMA_MM_I8_MICRO_PREFILL", false);
+    if (multi_row && range_mc.Num() >= 2) {
+      static const bool wide = MMI8Flag("GEMMA_MM_I8_MICRO_PREFILL16", false);
+      if (wide) {
+        MMI8PackedMicroPrefill16<kBlock, kAlignedGroups, kDual>(
+            A, B, range_mc, range_kc, range_nc, args, tag, C);
+      } else {
+        MMI8PackedMicroPrefill<kBlock, kAlignedGroups, kDual>(
+            A, B, range_mc, range_kc, range_nc, args, tag, C);
+      }
+      return;
+    }
+#endif
     const hn::ScalableTag<int8_t> da;
     const hn::ScalableTag<uint8_t> db;
     const hn::Repartition<int32_t, decltype(da)> di;
@@ -1178,6 +1198,8 @@ class MMI8Kernel {
     PackedMicroReference(A, B, range_mc, range_kc, range_nc, args, tag, C);
   }
 
+ public:
+  // Dispatch packed microscaled operands through the selected prefill tile.
   template <typename BT, class Tag, class CView>
   static HWY_INLINE void PackedMicroB3A2C0(const AView& A, const BT& B,
                                            const IndexRange& range_mc,
@@ -1185,6 +1207,16 @@ class MMI8Kernel {
                                            const IndexRange& range_nc,
                                            const MMArgs& args, Tag tag,
                                            CView C) {
+#if HWY_TARGET == HWY_AVX2 && GEMMA_MM_I8_BIASED_B && defined(__GNUC__) && \
+    !defined(__clang__) && HWY_ARCH_X86_64
+    if (MMI8TryMicroPrefill48(A, B, range_mc, range_kc, range_nc, args, tag, C)) {
+      return;
+    }
+    if (range_mc.Num() >= 2 &&
+        MMI8TryMicroPrefill32(A, B, range_mc, range_kc, range_nc, args, tag, C)) {
+      return;
+    }
+#endif
     if (B.dual_a && A.residual != nullptr) {
       DispatchPackedMicro<true>(A, B, range_mc, range_kc, range_nc, args, tag,
                                 C);
@@ -1195,6 +1227,7 @@ class MMI8Kernel {
                                  tag, C);
     }
   }
+ private:
   template <bool kNative, typename BT, class Tag, class CView>
   static HWY_INLINE void DispatchMicroBlock(const AView& A, const BT& B,
                                             const IndexRange& range_mc,
