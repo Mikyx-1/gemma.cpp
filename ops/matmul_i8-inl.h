@@ -1624,6 +1624,7 @@ static HWY_INLINE void MMI8PrepareInputRow(
 }
 
 #include "ops/matmul_i8_typed_rotate-inl.h"
+#include "ops/matmul_i8_fused_quant-inl.h"
 
 // Quantizes all `M x K` of `A` into `storage`, in parallel over rows.
 // This replaces `MMDecompress::DecompressA` and is the same order of cost:
@@ -1634,6 +1635,16 @@ QuantizeA(const MatPtrT<TA>& A, MMI8AStorage& storage, ThreadingContext& ctx,
           size_t cluster_idx, const float* a_pre_scale = nullptr,
           size_t block_size = 0, MMI8AView* residual = nullptr,
           size_t prefix_scan_mode = MMI8PrefixScanMode()) {
+#if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+  if (MMI8FusedDualQuantEnabled() &&
+      MMI8FusedDualQuantSupported(A.Rows(), A.Cols(), block_size,
+                                   residual != nullptr)) {
+    const auto fused = MMI8QuantizeAFusedDual(
+        A, storage, ctx, cluster_idx, a_pre_scale, block_size, residual,
+        prefix_scan_mode);
+    return fused;
+  }
+#endif
   MMI8AView view = storage.View(A.Extents(), block_size);
   if (residual != nullptr) {
     *residual = storage.ResidualView(A.Extents(), block_size);
