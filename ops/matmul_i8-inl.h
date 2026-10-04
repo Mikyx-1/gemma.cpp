@@ -1645,12 +1645,87 @@ static HWY_NOINLINE MMI8B PackB(const MatPtrT<float>& B_f32,
 //------------------------------------------------------------------------------
 // Entry point
 
+static inline bool MMI8ExactAutotune() {
+  static const bool enabled = MMI8Flag("GEMMA_MM_I8_EXACT_AUTOTUNE");
+  return enabled;
+}
+
+static inline bool MMI8SameKPartition(const MMConfig& a, const MMConfig& b,
+                                      size_t K) {
+  const auto ra = a.RangesOfKC(K);
+  const auto rb = b.RangesOfKC(K);
+  if (ra.NumTasks() != rb.NumTasks()) return false;
+  for (size_t i = 0; i < ra.NumTasks(); ++i) {
+    if (static_cast<size_t>(ra.Range(i).begin()) !=
+            static_cast<size_t>(rb.Range(i).begin()) ||
+        static_cast<size_t>(ra.Range(i).end()) !=
+            static_cast<size_t>(rb.Range(i).end())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Keep the original fixed configuration's rounding boundaries. Changes to
+// other tiling parameters only reorder independent output elements.
+static inline std::vector<MMConfig> MMI8ExactCandidates(
+    const std::vector<MMConfig>& candidates, size_t K) {
+  HWY_ASSERT(!candidates.empty());
+  std::vector<MMConfig> legal;
+  legal.reserve(candidates.size());
+  for (const auto& candidate : candidates) {
+    if (MMI8SameKPartition(candidates.front(), candidate, K)) {
+      legal.push_back(candidate);
+    }
+  }
+
+  // A bounded search finishes after at most 32 ordinary invocations. Keep
+  // the reference first, then spread trials over loop orders, register tiles,
+  // task granularity and cache tiles rather than adjacent similar configs.
+  const auto tile_distance = [](size_t a, size_t b) {
+    size_t hi = HWY_MAX(a, b);
+    const size_t lo = HWY_MIN(a, b);
+    size_t distance = 0;
+    while (hi > lo) {
+      hi = hwy::DivCeil(hi, size_t{2});
+      ++distance;
+    }
+    return distance;
+  };
+  const auto distance = [&](const MMConfig& a, const MMConfig& b) {
+    return size_t{32} * (a.Order() != b.Order()) +
+           size_t{16} * (a.MR() != b.MR()) +
+           size_t{8} * (a.InnerTasks() != b.InnerTasks()) +
+           tile_distance(a.MC(), b.MC()) + tile_distance(a.NC(), b.NC());
+  };
+  std::vector<MMConfig> selected;
+  selected.reserve(8);
+  selected.push_back(legal.front());
+  while (selected.size() < 8) {
+    size_t best_index = 0;
+    size_t best_distance = 0;
+    for (size_t i = 1; i < legal.size(); ++i) {
+      size_t nearest = ~size_t{0};
+      for (const auto& previous : selected) {
+        nearest = HWY_MIN(nearest, distance(legal[i], previous));
+      }
+      if (nearest > best_distance) {
+        best_distance = nearest;
+        best_index = i;
+      }
+    }
+    if (best_distance == 0) break;
+    selected.push_back(legal[best_index]);
+  }
+  return selected;
+}
+
 static inline std::vector<MMConfig> MMI8Candidates(
     MatMulEnv& env, size_t M, size_t K, size_t N, size_t num_B,
     size_t sizeof_TC, bool prefer_full_k = false) {
   auto candidates = MMCandidates(env.ctx.cache_info, M, K, N, num_B,
                                   sizeof_TC, env.print_config);
-  if (!env.autotune &&
+  if ((!env.autotune || MMI8ExactAutotune()) &&
       (prefer_full_k || MMI8Flag("GEMMA_MM_I8_MIN_K_SPLITS"))) {
     // Generic candidates enumerate split-K loop orders first. Prefer fewer
     // intermediate output rounds in fixed W8A8 evaluation while retaining the
@@ -1661,8 +1736,33 @@ static inline std::vector<MMConfig> MMI8Candidates(
         });
     if (best != candidates.end()) std::iter_swap(candidates.begin(), best);
   }
+  if (MMI8ExactAutotune()) return MMI8ExactCandidates(candidates, K);
   return candidates;
 }
+
+// The ordinary notifier follows env.autotune, which can remain disabled for
+// reproducible BF16 matmuls while the constrained I8 tuner is enabled.
+static inline void MMI8NotifyAutotuneResult(MatMulEnv& env, size_t M, size_t K,
+                                            size_t N, size_t num_B, uint64_t t0,
+                                            MMAutoTune<MMConfig>& tuner,
+                                            const MMConfig& cfg) {
+  if (env.autotune || !MMI8ExactAutotune()) {
+    MMImpl::NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
+    return;
+  }
+  const uint64_t t1 =
+      env.have_timer_stop ? hwy::timer::Stop() : hwy::timer::Start();
+  tuner.NotifyTicks(t1 - t0);
+  if (HWY_UNLIKELY(env.print_best && tuner.Best())) {
+    const auto& best = *tuner.Best();
+    fprintf(stderr,
+            "I8 exact autotune %zu,%zu,%zu,B%zu: MR%zu MC%zu KC%zu NC%zu "
+            "%s tasks%zu\n",
+            M, K, N, num_B, best.MR(), best.MC(), best.KC(), best.NC(),
+            StringFromOrder(best.Order()), best.InnerTasks());
+  }
+}
+
 
 // As `MatMul`, but `A` is quantized on the fly and `B` was packed by `PackB`.
 // Reuses the same blocking, parallelization and autotuning as `MatMul`; only
@@ -1713,7 +1813,7 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
     tuner.SetCandidates(
         MMI8Candidates(env, M, K, N, num_B, sizeof(TC),
                        MMI8PreferFullHeadK(B, M, hwy::IsSame<TC, float>())),
-        env.autotune);
+        env.autotune || MMI8ExactAutotune());
   }
 
   const MMConfig& cfg = tuner.NextConfig();
@@ -1721,7 +1821,7 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
 
   const uint64_t t0 = hwy::timer::Start();
   MMLoops::Dispatch<MMI8Kernel>(A_view, B, B2, C_rows, args);
-  MMImpl::NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
+  MMI8NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
 
   return &per_key;
 }
@@ -1772,9 +1872,8 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
     HWY_ASSERT(M <= kMaxBatchSize);
     HWY_ASSERT(N % kNR == 0);
     const size_t max_M = MMKeys::BucketM(M);
-    tuner.SetCandidates(
-        MMI8Candidates(env, max_M, K, N, num_B, sizeof(BF16)),
-        env.autotune);
+    tuner.SetCandidates(MMI8Candidates(env, max_M, K, N, num_B, sizeof(BF16)),
+                        env.autotune || MMI8ExactAutotune());
   }
 
   const MMConfig& cfg = tuner.NextConfig();
@@ -1782,7 +1881,7 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
                     tuner, cfg);
   const uint64_t t0 = hwy::timer::Start();
   MMLoops::Dispatch<MMI8Kernel>(A_view, B1, &B2, C_rows, args);
-  MMImpl::NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
+  MMI8NotifyAutotuneResult(env, M, K, N, num_B, t0, tuner, cfg);
 
   return &per_key;
 }
