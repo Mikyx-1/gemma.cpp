@@ -1891,6 +1891,7 @@ static inline void MMI8NotifyAutotuneResult(MatMulEnv& env, size_t M, size_t K,
   }
 }
 
+#include "ops/matmul_i8_compact_prefix-inl.h"
 
 // As `MatMul`, but `A` is quantized on the fly and `B` was packed by `PackB`.
 // Reuses the same blocking, parallelization and autotuning as `MatMul`; only
@@ -1919,6 +1920,8 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
   // Prefix sparsity is safe only for this settled config. Unknown or active
   // tuning states retain the original arbitrary-range prefix contract.
   MMAutoTune<MMConfig>& tuner = per_key.autotune;
+  if (MMI8TryCompactPrefixMatMul(A, B, add, env, C, C_rows, a_storage,
+                                  options, tuner)) return &per_key;
   const size_t prefix_mode = MMI8PrefixModeFor(B, nullptr, tuner.Best(), K);
   // Outside the timed section, as `MMDecompress::MaybeDecompressA`.
   MMI8AView residual;
