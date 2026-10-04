@@ -1451,10 +1451,19 @@ static HWY_INLINE void MMI8PrefixScan16(const int8_t* input, size_t count,
 }
 #endif
 
+#include "ops/matmul_i8_prefix_endpoints-inl.h"
+
 static HWY_INLINE void MMI8BuildPrefix(const int8_t* input, size_t count,
                                        int32_t base, int32_t* prefix,
                                        size_t mode) {
 #if HWY_TARGET == HWY_AVX2 && HWY_ARCH_X86
+#if GEMMA_MM_I8_BIASED_B
+  if (mode == kMMI8PrefixEndpointsMode) {
+    if (MMI8PrefixEndpoints32(input, count, base, prefix)) return;
+    // Defensive direct-call fallback. Production routing admits whole groups.
+    mode = MMI8PrefixScanMode();
+  }
+#endif
   if (mode == 16) {
     MMI8PrefixScan16(input, count, base, prefix);
     return;
@@ -1907,7 +1916,10 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
       M, K, N, num_B, cache.VectorBytes(), env.per_cluster[cluster_idx],
       B.block_size ? MMActivation::kI8Block : MMActivation::kI8);
 
-  const size_t prefix_mode = MMI8PrefixScanMode();
+  // Prefix sparsity is safe only for this settled config. Unknown or active
+  // tuning states retain the original arbitrary-range prefix contract.
+  MMAutoTune<MMConfig>& tuner = per_key.autotune;
+  const size_t prefix_mode = MMI8PrefixModeFor(B, nullptr, tuner.Best(), K);
   // Outside the timed section, as `MMDecompress::MaybeDecompressA`.
   MMI8AView residual;
   const MMI8AView A_view =
@@ -1918,7 +1930,6 @@ HWY_NOINLINE MMPerKey* MatMulI8(const MatPtrT<TA>& A, const MMI8B& B,
 
   // Scales are per row/column, hence folded into `A_view.scale` and
   // `B.scale`; the scalar `MMArgs::scale_A` is unused.
-  MMAutoTune<MMConfig>& tuner = per_key.autotune;
   if (HWY_LIKELY(tuner.Best())) {
     const MMArgs args(env, M, K, N, /*scale_A=*/1.0f, add, options, tuner,
                       *tuner.Best());
@@ -1972,14 +1983,14 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
 
   HWY_DASSERT(B1.a_pre_scale == nullptr && B2.a_pre_scale == nullptr);
   HWY_ASSERT(B1.block_size == B2.block_size);
-  const size_t prefix_mode = MMI8PrefixScanMode();
+  MMAutoTune<MMConfig>& tuner = per_key.autotune;
+  const size_t prefix_mode = MMI8PrefixModeFor(B1, &B2, tuner.Best(), K);
   MMI8AView residual;
   const bool dual = MMI8UseDualA(B1, M) || MMI8UseDualA(B2, M);
   const MMI8AView A_view =
       QuantizeA(A, a_storage, env.ctx, cluster_idx, nullptr, B1.block_size,
                 dual ? &residual : nullptr, prefix_mode);
 
-  MMAutoTune<MMConfig>& tuner = per_key.autotune;
   if (HWY_LIKELY(tuner.Best())) {
     const MMArgs args(env, M, K, N, /*scale_A=*/1.0f, /*add=*/nullptr, options,
                       tuner, *tuner.Best());
