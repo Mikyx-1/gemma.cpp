@@ -1892,6 +1892,7 @@ static inline void MMI8NotifyAutotuneResult(MatMulEnv& env, size_t M, size_t K,
 }
 
 #include "ops/matmul_i8_compact_prefix-inl.h"
+#include "ops/matmul_i8_gate_prefill-inl.h"
 
 // As `MatMul`, but `A` is quantized on the fly and `B` was packed by `PackB`.
 // Reuses the same blocking, parallelization and autotuning as `MatMul`; only
@@ -1987,6 +1988,8 @@ static HWY_NOINLINE MMPerKey* TwoMatMulI8(const MatPtrT<BF16>& A,
   HWY_DASSERT(B1.a_pre_scale == nullptr && B2.a_pre_scale == nullptr);
   HWY_ASSERT(B1.block_size == B2.block_size);
   MMAutoTune<MMConfig>& tuner = per_key.autotune;
+  if (MMI8TryGatePrefill(A, B1, B2, env, C, C_rows, a_storage,
+                          options, tuner)) return &per_key;
   const size_t prefix_mode = MMI8PrefixModeFor(B1, &B2, tuner.Best(), K);
   MMI8AView residual;
   const bool dual = MMI8UseDualA(B1, M) || MMI8UseDualA(B2, M);
