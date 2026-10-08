@@ -272,161 +272,165 @@ KVCache::KVCache(const ModelConfig& config, const InferenceArgs& inference_args,
     const size_t num_tiles =
         hwy::DivCeil(CappedSeqLen(config, inference_args), kTileSize);
     tiled_seq_len = num_tiles * kTileSize;
-    Type kv_cache_type;
-    if (runtime_config.attention_impl ==
-        AttentionImpl::kFlashMatrixAccumulation) {
-      kv_cache_type = runtime_config.kv_cache_type.value_or(Type::kBF16);
-    } else if (runtime_config.attention_impl ==
-                   AttentionImpl::kFlashTransposedQsBF16
-    ) {
-      kv_cache_type = runtime_config.kv_cache_type.value_or(Type::kBF16);
-    } else if (runtime_config.attention_impl ==
-                   AttentionImpl::kFlashTransposedQsInt16 ||
-               runtime_config.attention_impl ==
-                   AttentionImpl::kFlashTransposedQsInt8 ||
-               runtime_config.attention_impl ==
-                   AttentionImpl::kInt8MatrixAccumulation) {
-      if (runtime_config.kv_cache_type.has_value() &&
-          runtime_config.kv_cache_type.value() != Type::kInt8) {
-        HWY_WARN(
-            "You are have set kv_cache_type to %s, but you are using "
-            "an attention implementation which only "
-            "supports Int8. kv_cache_type will be set to Int8.",
-            TypeName(runtime_config.kv_cache_type.value()));
-      }
-      kv_cache_type = Type::kInt8;
-    } else {
-      kv_cache_type = runtime_config.kv_cache_type.value_or(Type::kF32);
-    }
-
-    // Allocate tile size using max_qkv_dim to prevent out-of-bounds corruption
-    int max_tile_length = 2 * max_qkv_dim * kTileSize;
-    if (kv_cache_type == Type::kInt8) {
-      // microscaling
-      max_tile_length += 2 * sizeof(BF16) * kTileSize;
+    // Default Flash attention reads k_cache/v_cache above. Only the other
+    // implementations consume the separate compact tiled representation.
+    if (runtime_config.attention_impl != AttentionImpl::kFlash) {
+      Type kv_cache_type;
       if (runtime_config.attention_impl ==
-          AttentionImpl::kFlashTransposedQsInt8) {
-        // K sums
-        max_tile_length += sizeof(int32_t) * kTileSize;
-      }
-    }
-    auto num_tiles_per_head = [](size_t window_size, size_t prefill_tbatch_size,
-                                 size_t max_seq_len) {
-      return hwy::DivCeil(
-          std::min(max_seq_len, window_size + prefill_tbatch_size), kTileSize);
-    };
-
-    size_t total_local_num_tiles = 0;
-    size_t total_global_num_tiles = 0;
-    size_t local_tile_length = 0;
-    size_t global_tile_length = 0;
-
-    for (size_t i = 0; i < num_layers; ++i) {
-      size_t num_tiles = num_tiles_per_head(kv_attention_window_sizes[i],
-                                            runtime_config.prefill_tbatch_size,
-                                            config.max_seq_len) *
-                         kv_layer_configs[i].kv_heads;
-
-      size_t tile_len = 2 * kv_layer_configs[i].qkv_dim * kTileSize;
-      if (kv_cache_type == Type::kInt8) {
-        tile_len += 2 * sizeof(BF16) * kTileSize;
-        if (runtime_config.attention_impl ==
-            AttentionImpl::kFlashTransposedQsInt8) {
-          // K sums
-          tile_len += sizeof(int32_t) * kTileSize;
+          AttentionImpl::kFlashMatrixAccumulation) {
+        kv_cache_type = runtime_config.kv_cache_type.value_or(Type::kBF16);
+      } else if (runtime_config.attention_impl ==
+                     AttentionImpl::kFlashTransposedQsBF16
+      ) {
+        kv_cache_type = runtime_config.kv_cache_type.value_or(Type::kBF16);
+      } else if (runtime_config.attention_impl ==
+                     AttentionImpl::kFlashTransposedQsInt16 ||
+                 runtime_config.attention_impl ==
+                     AttentionImpl::kFlashTransposedQsInt8 ||
+                 runtime_config.attention_impl ==
+                     AttentionImpl::kInt8MatrixAccumulation) {
+        if (runtime_config.kv_cache_type.has_value() &&
+            runtime_config.kv_cache_type.value() != Type::kInt8) {
+          HWY_WARN(
+              "You are have set kv_cache_type to %s, but you are using "
+              "an attention implementation which only "
+              "supports Int8. kv_cache_type will be set to Int8.",
+              TypeName(runtime_config.kv_cache_type.value()));
         }
-      }
-
-      if (kv_attention_window_sizes[i] == config.max_seq_len) {
-        total_global_num_tiles += num_tiles;
-        global_tile_length = tile_len;
+        kv_cache_type = Type::kInt8;
       } else {
-        total_local_num_tiles += num_tiles;
-        local_tile_length = tile_len;
+        kv_cache_type = runtime_config.kv_cache_type.value_or(Type::kF32);
       }
-    }
 
-    if (total_local_num_tiles > 0) {
-      Extents2D local_extents(total_local_num_tiles, local_tile_length);
-      compact_local_kv_cache_ptr =
-          MatPtr("kv_tiled_local", kv_cache_type, local_extents);
-      if (runtime_config.attention_impl ==
-          AttentionImpl::kFlashMatrixAccumulation) {
-        compact_local_kv_cache_ptr.SetLayout(
-            MatPtr::Layout::kBF16MatrixAccumulation);
-      } else if (runtime_config.attention_impl ==
-                 AttentionImpl::kInt8MatrixAccumulation) {
-        compact_local_kv_cache_ptr.SetLayout(
-            MatPtr::Layout::kInt8MatrixAccumulation);
-      }
-      compact_local_kv_cache.AllocateFor(compact_local_kv_cache_ptr, allocator,
-                                         MatPadding::kPacked);
-    }
-
-    if (total_global_num_tiles > 0) {
-      Extents2D global_extents(total_global_num_tiles, global_tile_length);
-      compact_global_kv_cache_ptr =
-          MatPtr("kv_tiled_global", kv_cache_type, global_extents);
-      if (runtime_config.attention_impl ==
-          AttentionImpl::kFlashMatrixAccumulation) {
-        compact_global_kv_cache_ptr.SetLayout(
-            MatPtr::Layout::kBF16MatrixAccumulation);
-      } else if (runtime_config.attention_impl ==
-                 AttentionImpl::kInt8MatrixAccumulation) {
-        compact_global_kv_cache_ptr.SetLayout(
-            MatPtr::Layout::kInt8MatrixAccumulation);
-      }
-      compact_global_kv_cache.AllocateFor(compact_global_kv_cache_ptr,
-                                          allocator,
-                                          MatPadding::kPacked);
-    }
-
-    if (compact_global_kv_cache_ptr.HasPtr()) {
-      compact_kv_cache_ptr = compact_global_kv_cache_ptr;
-    } else {
-      compact_kv_cache_ptr = compact_local_kv_cache_ptr;
-    }
-
-    size_t local_tiles_processed = 0;
-    size_t global_tiles_processed = 0;
-    kv_head_ptrs.clear();
-    kv_head_ptrs.reserve(kv_head_accum);
-    for (size_t i = 0; i < num_layers; ++i) {
-      size_t layer_tile_length = 2 * kv_layer_configs[i].qkv_dim * kTileSize;
+      // Allocate tile size using max_qkv_dim to prevent out-of-bounds corruption
+      int max_tile_length = 2 * max_qkv_dim * kTileSize;
       if (kv_cache_type == Type::kInt8) {
-        layer_tile_length += 2 * sizeof(BF16) * kTileSize;
+        // microscaling
+        max_tile_length += 2 * sizeof(BF16) * kTileSize;
         if (runtime_config.attention_impl ==
             AttentionImpl::kFlashTransposedQsInt8) {
           // K sums
-          layer_tile_length += sizeof(int32_t) * kTileSize;
+          max_tile_length += sizeof(int32_t) * kTileSize;
         }
       }
-      bool is_global = kv_attention_window_sizes[i] == config.max_seq_len;
-      for (size_t kv = 0; kv < kv_layer_configs[i].kv_heads; ++kv) {
-        size_t num_tiles_per_kv_head = num_tiles_per_head(
-            kv_attention_window_sizes[i], runtime_config.prefill_tbatch_size,
-            config.max_seq_len);
-        MatPtr kv_ptr("kv_ptr", kv_cache_type,
-                      Extents2D(num_tiles_per_kv_head, layer_tile_length));
-        if (is_global) {
-          kv_ptr.SetPtr(
-              compact_global_kv_cache_ptr.RowBytes(global_tiles_processed),
-              compact_global_kv_cache_ptr.Stride());
-          global_tiles_processed += num_tiles_per_kv_head;
-        } else {
-          kv_ptr.SetPtr(
-              compact_local_kv_cache_ptr.RowBytes(local_tiles_processed),
-              compact_local_kv_cache_ptr.Stride());
-          local_tiles_processed += num_tiles_per_kv_head;
+      auto num_tiles_per_head = [](size_t window_size, size_t prefill_tbatch_size,
+                                   size_t max_seq_len) {
+        return hwy::DivCeil(
+            std::min(max_seq_len, window_size + prefill_tbatch_size), kTileSize);
+      };
+
+      size_t total_local_num_tiles = 0;
+      size_t total_global_num_tiles = 0;
+      size_t local_tile_length = 0;
+      size_t global_tile_length = 0;
+
+      for (size_t i = 0; i < num_layers; ++i) {
+        size_t num_tiles = num_tiles_per_head(kv_attention_window_sizes[i],
+                                              runtime_config.prefill_tbatch_size,
+                                              config.max_seq_len) *
+                           kv_layer_configs[i].kv_heads;
+
+        size_t tile_len = 2 * kv_layer_configs[i].qkv_dim * kTileSize;
+        if (kv_cache_type == Type::kInt8) {
+          tile_len += 2 * sizeof(BF16) * kTileSize;
+          if (runtime_config.attention_impl ==
+              AttentionImpl::kFlashTransposedQsInt8) {
+            // K sums
+            tile_len += sizeof(int32_t) * kTileSize;
+          }
         }
+
+        if (kv_attention_window_sizes[i] == config.max_seq_len) {
+          total_global_num_tiles += num_tiles;
+          global_tile_length = tile_len;
+        } else {
+          total_local_num_tiles += num_tiles;
+          local_tile_length = tile_len;
+        }
+      }
+
+      if (total_local_num_tiles > 0) {
+        Extents2D local_extents(total_local_num_tiles, local_tile_length);
+        compact_local_kv_cache_ptr =
+            MatPtr("kv_tiled_local", kv_cache_type, local_extents);
         if (runtime_config.attention_impl ==
             AttentionImpl::kFlashMatrixAccumulation) {
-          kv_ptr.SetLayout(MatPtr::Layout::kBF16MatrixAccumulation);
+          compact_local_kv_cache_ptr.SetLayout(
+              MatPtr::Layout::kBF16MatrixAccumulation);
         } else if (runtime_config.attention_impl ==
                    AttentionImpl::kInt8MatrixAccumulation) {
-          kv_ptr.SetLayout(MatPtr::Layout::kInt8MatrixAccumulation);
+          compact_local_kv_cache_ptr.SetLayout(
+              MatPtr::Layout::kInt8MatrixAccumulation);
         }
-        kv_head_ptrs.emplace_back(std::move(kv_ptr));
+        compact_local_kv_cache.AllocateFor(compact_local_kv_cache_ptr, allocator,
+                                           MatPadding::kPacked);
+      }
+
+      if (total_global_num_tiles > 0) {
+        Extents2D global_extents(total_global_num_tiles, global_tile_length);
+        compact_global_kv_cache_ptr =
+            MatPtr("kv_tiled_global", kv_cache_type, global_extents);
+        if (runtime_config.attention_impl ==
+            AttentionImpl::kFlashMatrixAccumulation) {
+          compact_global_kv_cache_ptr.SetLayout(
+              MatPtr::Layout::kBF16MatrixAccumulation);
+        } else if (runtime_config.attention_impl ==
+                   AttentionImpl::kInt8MatrixAccumulation) {
+          compact_global_kv_cache_ptr.SetLayout(
+              MatPtr::Layout::kInt8MatrixAccumulation);
+        }
+        compact_global_kv_cache.AllocateFor(compact_global_kv_cache_ptr,
+                                            allocator,
+                                            MatPadding::kPacked);
+      }
+
+      if (compact_global_kv_cache_ptr.HasPtr()) {
+        compact_kv_cache_ptr = compact_global_kv_cache_ptr;
+      } else {
+        compact_kv_cache_ptr = compact_local_kv_cache_ptr;
+      }
+
+      size_t local_tiles_processed = 0;
+      size_t global_tiles_processed = 0;
+      kv_head_ptrs.clear();
+      kv_head_ptrs.reserve(kv_head_accum);
+      for (size_t i = 0; i < num_layers; ++i) {
+        size_t layer_tile_length = 2 * kv_layer_configs[i].qkv_dim * kTileSize;
+        if (kv_cache_type == Type::kInt8) {
+          layer_tile_length += 2 * sizeof(BF16) * kTileSize;
+          if (runtime_config.attention_impl ==
+              AttentionImpl::kFlashTransposedQsInt8) {
+            // K sums
+            layer_tile_length += sizeof(int32_t) * kTileSize;
+          }
+        }
+        bool is_global = kv_attention_window_sizes[i] == config.max_seq_len;
+        for (size_t kv = 0; kv < kv_layer_configs[i].kv_heads; ++kv) {
+          size_t num_tiles_per_kv_head = num_tiles_per_head(
+              kv_attention_window_sizes[i], runtime_config.prefill_tbatch_size,
+              config.max_seq_len);
+          MatPtr kv_ptr("kv_ptr", kv_cache_type,
+                        Extents2D(num_tiles_per_kv_head, layer_tile_length));
+          if (is_global) {
+            kv_ptr.SetPtr(
+                compact_global_kv_cache_ptr.RowBytes(global_tiles_processed),
+                compact_global_kv_cache_ptr.Stride());
+            global_tiles_processed += num_tiles_per_kv_head;
+          } else {
+            kv_ptr.SetPtr(
+                compact_local_kv_cache_ptr.RowBytes(local_tiles_processed),
+                compact_local_kv_cache_ptr.Stride());
+            local_tiles_processed += num_tiles_per_kv_head;
+          }
+          if (runtime_config.attention_impl ==
+              AttentionImpl::kFlashMatrixAccumulation) {
+            kv_ptr.SetLayout(MatPtr::Layout::kBF16MatrixAccumulation);
+          } else if (runtime_config.attention_impl ==
+                     AttentionImpl::kInt8MatrixAccumulation) {
+            kv_ptr.SetLayout(MatPtr::Layout::kInt8MatrixAccumulation);
+          }
+          kv_head_ptrs.emplace_back(std::move(kv_ptr));
+        }
       }
     }
   } else {
@@ -443,6 +447,19 @@ KVCache::KVCache(const ModelConfig& config, const InferenceArgs& inference_args,
     }
   }
   InitDSState(config, allocator, ds_state, ds_state_snapshot, ds_state_offsets);
+}
+
+size_t KVCache::PaddingTokensToClear(size_t layer_idx, size_t end,
+                                    size_t padded_end) {
+  HWY_DASSERT(layer_idx < num_layers);
+  HWY_DASSERT(end <= padded_end);
+  if (zero_padding_.size() < num_layers) zero_padding_.resize(num_layers);
+  ZeroPadding& padding = zero_padding_[layer_idx];
+  // Newly written K/V positions are strictly before end. They cannot damage
+  // an already-zero interval that contains [end, padded_end).
+  const bool already_zero = end >= padding.begin && padded_end <= padding.end;
+  padding = {end, padded_end};
+  return already_zero ? 0 : padded_end - end;
 }
 
 KVCache KVCache::Copy() {

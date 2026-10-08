@@ -201,15 +201,20 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
 
   // The original qkv_einsum_w has shape [(heads + kv_heads * 2), qkv_dim,
   // model_dim], which we reshaped to (heads + kv_heads * 2) * qkv_dim rows.
-  CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
-             /*add=*/nullptr, env, activations.q);
-
-  if (skip_kv) return;
+  if (skip_kv) {
+    CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
+               /*add=*/nullptr, env, activations.q);
+    return;
+  }
   // Set up MatMul row pointers for writing to KV, which consists of
   // `kv_heads` pairs of (k, v) vectors. This safely handles wraparound
   // because rows are computed modulo seq_len.
   MatPtrT<KV_t> kv_rows("kv", Extents2D(activations.pre_att_rms_out.Rows(),
                                         layer.qkv_einsum_w2.Rows()));
+  // Q's matmul may reuse env.row_ptrs. Keep KV destinations independent so
+  // both projections can share prepared activations while executing Q first.
+  thread_local hwy::AlignedVector<uint8_t*> kv_row_ptrs;
+  kv_row_ptrs.resize(num_interleaved);
   for (size_t interleaved_idx = 0; interleaved_idx < num_interleaved;
        ++interleaved_idx) {
     // Index into qbatch, within [0, qbatch.Size()]
@@ -223,24 +228,35 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
         ? kv_layer_idx * cache_layer_size
         : qbatch.KV(qi).cache->layer_flat_offsets[kv_layer_idx];
 
-    env.row_ptrs[0][interleaved_idx] = reinterpret_cast<uint8_t*>(
+    kv_row_ptrs[interleaved_idx] = reinterpret_cast<uint8_t*>(
         qbatch.KV(qi).kv_cache.Row(cache_pos) + layer_offset);
   }
-  kv_rows.AttachRowPtrs(env.row_ptrs[0].get());
-  CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w2,
-             /*add=*/nullptr, env, kv_rows);
+  kv_rows.AttachRowPtrs(kv_row_ptrs.data());
+  if (!MaybeMatMulI8Pair(activations.pre_att_rms_out, layer.qkv_einsum_w1,
+                        layer.qkv_einsum_w2, env, activations.q, kv_rows)) {
+    CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w1,
+               /*add=*/nullptr, env, activations.q);
+    CallMatMul(activations.pre_att_rms_out, layer.qkv_einsum_w2,
+               /*add=*/nullptr, env, kv_rows);
+  }
 
+  const size_t kFloatsPerVector = FloatsPerVector();
+  size_t padding_tokens[kMaxBatchSize];
+  size_t max_transpose_tokens = num_tokens;
   for (size_t qi = 0; qi < qbatch.Size(); ++qi) {
     MaybeReshapeCache(qbatch.KV(qi).cache->KOrVDefaultCols(),
                       qbatch.KV(qi).k_cache);
     MaybeReshapeCache(qbatch.KV(qi).cache->KOrVDefaultCols(),
                       qbatch.KV(qi).v_cache);
+    const size_t end = qbatch.Pos(qi) + num_tokens;
+    const size_t padded_end = hwy::RoundUpTo(end, 2 * kFloatsPerVector);
+    padding_tokens[qi] = qbatch.KV(qi).cache->PaddingTokensToClear(
+        kv_layer_idx, end, padded_end);
+    max_transpose_tokens =
+        HWY_MAX(max_transpose_tokens, num_tokens + padding_tokens[qi]);
   }
-  const size_t kFloatsPerVector = FloatsPerVector();
-  const size_t kRoundedTokens =
-      hwy::RoundUpTo(num_tokens, 2 * kFloatsPerVector);
   const size_t kRoundedNumInterleaved =
-      kRoundedTokens * div_qbatch.GetDivisor();
+      max_transpose_tokens * div_qbatch.GetDivisor();
 
   // Apply positional encodings for K.
   // Note that 2D parallelism is not worth the fork/join overhead because the
@@ -254,7 +270,7 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
         const size_t qi = div_qbatch.Remainder(interleaved_idx);
         const size_t token_idx = div_qbatch.Divide(interleaved_idx);
         const size_t cache_pos = qbatch.Pos(qi) + token_idx;
-        if (token_idx >= kRoundedTokens) {
+        if (token_idx >= num_tokens + padding_tokens[qi]) {
           return;
         }
         // The innermost dimension of v is 2NF values from qkv_dim because they
@@ -271,8 +287,8 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
             qbatch.KV(qi).cache->VOffset(kv_layer_idx, head, kFloatsPerVector,
                                          cache_pos);
         if (token_idx >= num_tokens) {
-          // Create a zero-filled K/V pair for padding for out-of-sequence
-          // tokens.
+          // Only newly exposed padding in the final SIMD tile needs clearing.
+          // Previously cleared positions survive consecutive decode appends.
           TransposeOOBKVCacheRow(k, v, qkv_dim);
           return;
         }

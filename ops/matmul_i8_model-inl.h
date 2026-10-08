@@ -418,15 +418,25 @@ class MMI8WeightCache {
   }
 
   static bool PackedEligible(const MatPtr& B, size_t block_size) {
-    return PackedHeadEligible(B, block_size) ||
+    // Reorder the existing per-row W8 bytes only; this does not enable
+    // microscaling or change any weight/activation quantization. The N8 x K4
+    // kernel has an exact fallback for batched inputs and arbitrary K splits.
+    const bool row_head = block_size == 0 && MMI8NativeVNNI() &&
+                          strcmp(B.Name(), "c_embedding") == 0 &&
+                          B.Rows() >= 65536 && B.Rows() % 8 == 0 &&
+                          B.Cols() % 4 == 0;
+    return row_head || PackedHeadEligible(B, block_size) ||
            DualAEligible(B, block_size);
   }
 
   struct Entry {
     Entry(const MatPtr& B, const Allocator& allocator, size_t block_size)
         : data("B_i8", Extents2D(B.Rows(), B.Cols()), allocator,
-               PackedEligible(B, block_size) ? MatPadding::kPacked
-                                             : MatPadding::kOdd),
+               // These bytes are consumed directly, without the decompressed
+               // BF16 scratch used by the generic MatMul path. Eligible K is
+               // a multiple of the rotation block, so compact rows preserve
+               // alignment and avoid unused cache lines between weight rows.
+               MatPadding::kPacked),
           scale(B.Rows() * (block_size ? B.Cols() / block_size : 1)) {
       b = MMI8B{&data, scale.data(), nullptr, block_size};
       b.dual_a = DualAEligible(B, block_size);
@@ -696,6 +706,65 @@ class MMI8WeightCache {
   size_t a_max_M_ = 0;
   size_t a_max_K_ = 0;
 };
+
+// Both independently tuned projections must consume the whole K range before
+// the shared activation can omit its interior prefix sums. Keep only booleans
+// across these lookups: inserting the second key can invalidate references to
+// the first per-key state.
+static inline bool MMI8PairPrefixEndpointsOnly(size_t M, size_t K, size_t N1,
+                                             size_t N2, MatMulEnv& env) {
+  if (M != 1) return false;
+  const bool first = MMI8PrefixEndpointsOnly(
+      M, K, /*block_size=*/0, /*dual=*/false,
+      MMI8FindPerKey(M, K, N1, 1, 0, env, 0).autotune);
+  const bool second = MMI8PrefixEndpointsOnly(
+      M, K, /*block_size=*/0, /*dual=*/false,
+      MMI8FindPerKey(M, K, N2, 1, 0, env, 0).autotune);
+  return first && second;
+}
+
+// Computes two projections of the same input without preparing A twice.
+// Keep this explicit: a pointer-keyed activation cache would become stale as
+// the same activation buffers are overwritten by subsequent layers/tokens.
+// Outputs must have independent row-pointer storage, because dispatch can use
+// env.row_ptrs as temporary storage for either output.
+template <typename TA, typename TC1, typename TC2>
+static inline bool MaybeMatMulI8Pair(const MatPtrT<TA>& A, const MatPtr& B1,
+                                    const MatPtr& B2, MatMulEnv& env,
+                                    MatPtrT<TC1>& C1, MatPtrT<TC2>& C2) {
+  MMI8WeightCache& cache = MMI8WeightCache::Get();
+  if (!cache.Enabled() || !cache.Eligible(B1) || !cache.Eligible(B2) ||
+      B1.Cols() != A.Cols() || B2.Cols() != A.Cols() ||
+      MMI8CalibrationCaptureEnabled()) {
+    return false;
+  }
+  const MMI8B* i8_1 = CallUpcasted(&B1, [&](const auto* typed) {
+    return cache.Lookup(*typed, env);
+  });
+  const MMI8B* i8_2 = CallUpcasted(&B2, [&](const auto* typed) {
+    return cache.Lookup(*typed, env);
+  });
+  // Sharing is only valid for identical input transforms. Leave experimental
+  // microscaling/residual/equalization paths on their existing dispatch.
+  if (i8_1 == nullptr || i8_2 == nullptr || i8_1->block_size != 0 ||
+      i8_2->block_size != 0 || i8_1->a_pre_scale != nullptr ||
+      i8_2->a_pre_scale != nullptr || MMI8UseDualA(*i8_1, A.Rows()) ||
+      MMI8UseDualA(*i8_2, A.Rows())) {
+    return false;
+  }
+  MMI8AStorage& storage =
+      cache.AStorage(A.Rows(), A.Cols(), env.ctx.allocator);
+  const bool endpoints = MMI8PairPrefixEndpointsOnly(
+      A.Rows(), A.Cols(), B1.Rows(), B2.Rows(), env);
+  const MMI8AView prepared =
+      QuantizeA(A, storage, env.ctx, /*cluster_idx=*/0, nullptr,
+                /*block_size=*/0, /*residual=*/nullptr, endpoints);
+  MatMulI8Prepared(prepared, A.Rows(), A.Cols(), *i8_1, /*add=*/nullptr,
+                   env, C1);
+  MatMulI8Prepared(prepared, A.Rows(), A.Cols(), *i8_2, /*add=*/nullptr,
+                   env, C2);
+  return true;
+}
 
 // As `MaybeMatMulI8`, for the fused gated-FFN pair. Both operands must be
 // eligible, else we fall back so that the pair stays consistent.

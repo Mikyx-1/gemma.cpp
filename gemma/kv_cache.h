@@ -55,6 +55,14 @@ struct KVCache {
   // copy ctor to make the cost explicit.
   KVCache Copy();
 
+  // Records the zero padding required after writing [*, end) for one layer.
+  // The caller must clear the returned number of positions beginning at end
+  // before reading attention. Consecutive appends can reuse zero padding in
+  // the same SIMD tile. A rewind (including a new prompt in a reused cache)
+  // clears the padding again, because it may contain old keys/values.
+  size_t PaddingTokensToClear(size_t layer_idx, size_t end,
+                             size_t padded_end);
+
   size_t SeqLen() const {
     if (IsTiled()) {
       return tiled_seq_len.value();
@@ -233,6 +241,14 @@ struct KVCache {
 
  private:
   const Allocator& allocator_;
+
+  struct ZeroPadding {
+    size_t begin = 0;
+    size_t end = 0;
+  };
+  // This metadata is deliberately not copied by Copy(): a copied cache must
+  // establish its own padding before it is used for attention.
+  std::vector<ZeroPadding> zero_padding_;
 
   // For use by other ctor and Copy()
   KVCache(const Extents2D& kv_extents, size_t num_layers, size_t kv_heads,

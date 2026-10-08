@@ -1478,22 +1478,57 @@ static HWY_MAYBE_UNUSED TokenAndProb Top1OfSoftmax(Logits logits) {
   // Subtract max (avoid precision loss for large exponents) and exponentiate.
   const V max = hn::Set(d, argmax.prob);
   const V* pmax = &max;
-  hn::Transform(d, logits.data(), logits.size(),
-                [pmax](const auto d, const V value) HWY_ATTR {
-                  if constexpr (HWY_TARGET & HWY_ALL_SVE) {
-                    // Temporary workaround for buggy SVE codegen: avoid inlined
-                    // Exp().
-                    return hn::CallExp(d, hn::Sub(value, *pmax));
-                  } else {
-                    return hn::Exp(d, hn::Sub(value, *pmax));
-                  }
-                });
+  const auto exp_minus_max = [pmax](const auto d, const V value) HWY_ATTR {
+    if constexpr (HWY_TARGET & HWY_ALL_SVE) {
+      // Temporary workaround for buggy SVE codegen: avoid inlined Exp().
+      return hn::CallExp(d, hn::Sub(value, *pmax));
+    } else {
+      return hn::Exp(d, hn::Sub(value, *pmax));
+    }
+  };
+
+  float sum_exp;
+#if HWY_HAVE_FLOAT64 && HWY_TARGET != HWY_SCALAR
+  // Sum(float) promotes four consecutive half-vectors to double before each
+  // Update4. Feed exactly those same lanes and reduction tree directly from
+  // Exp, avoiding a separate scan of the stored exponentials. ArgmaxAndMax
+  // requires a multiple of two float vectors, so there is no summation tail.
+  const hn::Repartition<double, decltype(d)> dd;
+  const size_t N = hn::Lanes(d);
+  HWY_DASSERT(N == 2 * hn::Lanes(dd));
+  auto sum0 = hn::Zero(dd);
+  auto sum1 = hn::Zero(dd);
+  auto sum2 = hn::Zero(dd);
+  auto sum3 = hn::Zero(dd);
+  auto comp0 = hn::Zero(dd);
+  auto comp1 = hn::Zero(dd);
+  auto comp2 = hn::Zero(dd);
+  auto comp3 = hn::Zero(dd);
+  const SumKernelDouble kernel;
+  for (size_t i = 0; i < logits.size(); i += 2 * N) {
+    const V out0 = exp_minus_max(d, hn::LoadU(d, logits.data() + i));
+    const V out1 = exp_minus_max(d, hn::LoadU(d, logits.data() + i + N));
+    hn::StoreU(out0, d, logits.data() + i);
+    hn::StoreU(out1, d, logits.data() + i + N);
+    const auto d0 = hn::PromoteLowerTo(dd, out0);
+    const auto d1 = hn::PromoteUpperTo(dd, out0);
+    const auto d2 = hn::PromoteLowerTo(dd, out1);
+    const auto d3 = hn::PromoteUpperTo(dd, out1);
+    kernel.Update4(dd, d0, d1, d2, d3, d0, d1, d2, d3, sum0, sum1, sum2, sum3,
+                   comp0, comp1, comp2, comp3);
+  }
+  sum_exp =
+      kernel.Reduce(dd, sum0, sum1, sum2, sum3, comp0, comp1, comp2, comp3);
+#else
+  // Scalar and targets without float64 retain their existing summation path.
+  hn::Transform(d, logits.data(), logits.size(), exp_minus_max);
+  sum_exp = Sum(d, logits.data(), logits.size());
+#endif
 
   // Normalize to a single probability. The exact sum seems like it should not
   // make a huge difference. It halves the standard deviation of the sum of the
   // normalized probabilities from 1E-7 to 5E-8, but actually also changes the
   // generated text after a few hundred tokens.
-  const float sum_exp = Sum(d, logits.data(), logits.size());
   const float prob = logits[argmax.token] / sum_exp;
   return TokenAndProb{.token = argmax.token, .prob = prob};
 }
